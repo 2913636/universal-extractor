@@ -30,8 +30,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/JXJ/universal-extractor"
-Repository = "https://github.com/JXJ/universal-extractor"
+Homepage = "https://github.com/2913636/universal-extractor"
+Repository = "https://github.com/2913636/universal-extractor"
 
 # Core dependency
 dependencies = [
