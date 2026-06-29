@@ -1,0 +1,16 @@
+# Scrapling 开发全记录 — 依赖
+# 安装：pip install -r requirements.txt
+
+# 核心：Scrapling 网页抓取框架（全部可选依赖）
+scrapling[all]>=0.4.9
+
+# UniversalExtractor 必需
+pillow>=10.0.0               # 截图处理、感知哈希、拼接
+python-dotenv>=1.0.0         # 从 .env 加载 API Key
+
+# UniversalExtractor Vision OCR 后端（至少选一个）
+openai>=1.0.0                # GPT-4o / Qwen-VL（OpenAI 兼容 SDK）
+anthropic>=0.30.0            # Claude Sonnet 视觉 OCR
+
+# UniversalExtractor 本地 OCR（可选）
+pytesseract>=0.3.10          # 需额外安装 tesseract.exe + 中文语言包
