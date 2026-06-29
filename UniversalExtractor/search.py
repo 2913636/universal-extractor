@@ -110,42 +110,44 @@ def _search_exa(query: str, max_results: int = 10) -> list[str]:
 
 def _search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
     """
-    DuckDuckGo Instant Answer API — 免费，不需要 API Key。
+    DuckDuckGo HTML 搜索 — 免费，不需要 API Key。
 
-    非官方 API，可能不稳定。
+    用 html.duckduckgo.com 获取搜索结果，解析 uddg= 重定向链接
+    提取真实 URL。DuckDuckGo 用 uddg 参数编码目标 URL。
     """
     try:
         import urllib.request
-        import json
 
-        params = urllib.parse.urlencode({
-            "q": query,
-            "format": "json",
-            "no_html": "1",
-            "skip_disambig": "1",
-        })
+        params = urllib.parse.urlencode({"q": query})
         req = urllib.request.Request(
-            f"https://api.duckduckgo.com/?{params}",
-            headers={"User-Agent": "WebLens/1.0"},
+            f"https://html.duckduckgo.com/html/?{params}",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html",
+            },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+            html = resp.read().decode("utf-8", errors="replace")
 
+        # DuckDuckGo 用 uddg= 参数编码目标 URL
+        # 格式: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com
+        encoded_urls = re.findall(r"uddg=([^\"'&\s]+)", html)
+
+        # URL 解码并去重（保持顺序）
+        seen = set()
         urls = []
-        # AbstractURL
-        abstract_url = data.get("AbstractURL", "")
-        if abstract_url:
-            urls.append(abstract_url)
-        # RelatedTopics
-        for topic in data.get("RelatedTopics", []):
-            url = topic.get("FirstURL", "")
-            if url:
-                urls.append(url)
-        # Results
-        for item in data.get("Results", []):
-            url = item.get("FirstURL", "")
-            if url:
-                urls.append(item)
+        for eu in encoded_urls:
+            try:
+                decoded = urllib.parse.unquote(eu)
+                if decoded not in seen:
+                    seen.add(decoded)
+                    urls.append(decoded)
+            except Exception:
+                pass
 
         logger.info("DuckDuckGo: %d results for '%s'", len(urls), query[:50])
         return urls[:max_results]

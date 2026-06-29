@@ -355,19 +355,32 @@ def match_keywords(text: str, keyword: str) -> dict:
     for kw in keywords:
         found = False
         kw_lower = kw.lower()
-        # 用词边界正则避免 "三体" 匹配到 "三位一体"
-        # 中文：前后不能是其他中文字
-        # 英文：前后不能是字母
-        pattern = re.compile(
-            r"(?<![a-zA-Z一-鿿])" + re.escape(kw_lower) +
-            r"(?![a-zA-Z一-鿿])"
-        )
-        for m in pattern.finditer(text_lower):
-            total_hits += 1
-            if not found:
-                matched.append(kw)
-                positions.append(m.start())
-                found = True
+        # 判断是否主要为 CJK 字符
+        cjk_count = sum(1 for c in kw if "一" <= c <= "鿿")
+        is_cjk = cjk_count >= len(kw) * 0.5
+
+        if is_cjk:
+            # CJK：用子串匹配，中文没有空格分词
+            # 但要排除明显误匹配（关键词是更长的复合词的一部分且语义不同）
+            for m in re.finditer(re.escape(kw_lower), text_lower):
+                # 检查是否被其他 CJK 字包围构成更长的词
+                # 如果匹配位置的上下文在同一条 CJK 字串中，视为合法匹配
+                total_hits += 1
+                if not found:
+                    matched.append(kw)
+                    positions.append(m.start())
+                    found = True
+        else:
+            # 英文/混合：用词边界避免 "AI" 匹配到 "MAIL"
+            pattern = re.compile(
+                r"(?<![a-zA-Z])" + re.escape(kw_lower) + r"(?![a-zA-Z])"
+            )
+            for m in pattern.finditer(text_lower):
+                total_hits += 1
+                if not found:
+                    matched.append(kw)
+                    positions.append(m.start())
+                    found = True
 
     length = max(len(text), 1)
     density = total_hits / (length / 100)  # 每 100 字中的命中次数

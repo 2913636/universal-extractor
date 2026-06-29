@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "universal-extractor"
@@ -50,7 +50,8 @@ all = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["UniversalExtractor*"]
+where = ["."]
+include = ["UniversalExtractor", "UniversalExtractor.*"]
 
 [tool.setuptools.package-dir]
 "universal_extractor" = "UniversalExtractor"
