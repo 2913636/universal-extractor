@@ -190,54 +190,106 @@ def search_urls(
     backends: Optional[list[str]] = None,
     site_filter: Optional[str] = None,
 ) -> list[str]:
-    """
-    聚合多个搜索后端，返回去重排序后的 URL 列表。
+    """聚合多引擎搜索结果，按交叉命中数排序后返回 URL 列表。"""
+    meta = search_with_metadata(query, max_results, backends=backends, site_filter=site_filter)
+    return [item["url"] for item in meta["results"]]
 
-    Parameters:
-        query: 搜索关键词
-        max_results: 最多返回多少条
-        backends: 指定后端列表，默认全部启用：
-                  ``["brave", "exa", "duckduckgo"]``
-        site_filter: 限定站点，如 ``"bilibili.com"``
+
+def search_with_metadata(
+    query: str,
+    max_results: int = 15,
+    *,
+    backends: Optional[list[str]] = None,
+    site_filter: Optional[str] = None,
+) -> dict:
+    """
+    聚合多引擎搜索，返回完整元数据。
+
+    增强:
+      - 多引擎交叉对比: 同一 URL 被 >= 2 个引擎发现 → 提升排名
+      - 每个 URL 标注来源引擎 + 排名位置
+      - 返回各引擎统计信息
 
     Returns:
-        URL 列表（去重，每个后端的结果交替排列）
+        {
+            "results": [{"url": "...", "backends": ["brave","duckduckgo"], "cross_hits": 2, "ranks": {...}}, ...],
+            "backends_used": ["brave", "duckduckgo"],
+            "backend_stats": {"brave": 15, "duckduckgo": 10},
+            "total_raw": 25,
+            "total_unique": 18,
+        }
     """
     if backends is None:
         backends = ["brave", "exa", "duckduckgo"]
 
-    # 附加站点限定
     search_query = query
     if site_filter:
         search_query = f"site:{site_filter} {query}"
 
-    # 并行收集（简单串行，未来可改 asyncio）
-    all_urls: list[str] = []
-    seen: set[str] = set()
+    # Collect per-backend results with rank tracking
+    url_sources: dict[str, list[str]] = {}  # url → [backend, ...]
+    url_ranks: dict[str, dict[str, int]] = {}  # url → {backend: rank}
+    backend_stats: dict[str, int] = {}
+    total_raw = 0
 
     for backend in backends:
         try:
             if backend == "brave":
                 results = _search_brave(search_query, max_results)
             elif backend == "exa":
-                results = _search_exa(query, max_results)  # Exa 支持语义，不加 site:
+                results = _search_exa(query, max_results)
             elif backend == "duckduckgo":
                 results = _search_duckduckgo(search_query, max_results)
             else:
                 logger.warning("Unknown search backend: %s", backend)
                 continue
 
-            # 去重
-            for url in results:
-                if url not in seen:
-                    seen.add(url)
-                    all_urls.append(url)
+            backend_stats[backend] = len(results)
+            total_raw += len(results)
+
+            for rank, url in enumerate(results):
+                if url not in url_sources:
+                    url_sources[url] = []
+                    url_ranks[url] = {}
+                url_sources[url].append(backend)
+                url_ranks[url][backend] = rank
+
         except Exception as exc:
             logger.warning("Backend '%s' error: %s", backend, exc)
+            backend_stats[backend] = 0
 
-    logger.info("Search total: %d unique URLs from %d backends",
-                len(all_urls), len(backends))
-    return all_urls[:max_results]
+    # Score & sort: cross_hits (desc) → avg rank (asc)
+    scored = []
+    for url, sources in url_sources.items():
+        cross_hits = len(sources)
+        avg_rank = sum(url_ranks[url].values()) / len(url_ranks[url])
+        scored.append((cross_hits, -avg_rank, url))
+
+    scored.sort(reverse=True)
+
+    results = [
+        {
+            "url": url,
+            "backends": url_sources[url],
+            "cross_hits": cross_hits,
+            "ranks": url_ranks[url],
+        }
+        for cross_hits, _, url in scored[:max_results]
+    ]
+
+    logger.info(
+        "Search: %d raw → %d unique from %d backends, top cross-hit=%d",
+        total_raw, len(url_sources), len(backends),
+        results[0]["cross_hits"] if results else 0,
+    )
+
+    return {
+        "results": results,
+        "backends_used": [b for b in backends if backend_stats.get(b, 0) > 0],
+        "backend_stats": backend_stats,
+        "total_raw": total_raw,
+        "total_unique": len(url_sources),
+    }
 
 
 def is_likely_content_url(url: str) -> bool:

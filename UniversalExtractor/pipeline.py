@@ -943,30 +943,37 @@ class Pipeline:
     def _phase_search(
         self, query: str, site_filter: Optional[str], result: PipelineResult
     ) -> list[dict]:
-        """Phase 1: 多引擎搜索 + 去重 + 分类过滤。"""
-        from .search import search_urls
+        """Phase 1: 多引擎搜索 + 交叉对比 + 分类过滤。"""
+        from .search import search_with_metadata
 
-        urls = search_urls(
+        meta = search_with_metadata(
             query,
             max_results=self.config.search_max_results,
             site_filter=site_filter or self.config.site_filter,
             backends=self.config.search_backends,
         )
-        result.search_candidates_total = len(urls)
 
-        # 分类过滤
+        result.search_candidates_total = meta["total_unique"]
+        result.search_backends_used = meta["backends_used"]
+
+        # 分类过滤（cross_hit 越高的 URL 排名越前）
         candidates = []
-        for u in urls:
+        for item in meta["results"]:
+            u = item["url"]
             verdict = classify_url(u)
-            result.url_verdict = verdict
+            if not result.url_verdict:
+                result.url_verdict = verdict
             if verdict["is_content"] or verdict["type"] == "novel_index":
                 candidates.append({
                     "url": u,
                     "type": verdict.get("type", "unknown"),
+                    "cross_hits": item["cross_hits"],
+                    "backends": item["backends"],
                 })
 
-        logger.info("Search: %d raw → %d filtered URLs for '%s'",
-                     len(urls), len(candidates), query[:40])
+        logger.info("Search: %d raw/%d unique → %d filtered for '%s'",
+                     meta["total_raw"], meta["total_unique"],
+                     len(candidates), query[:40])
         return candidates
 
     def _phase_verify(
@@ -1115,8 +1122,33 @@ class Pipeline:
             details["failed"] += 1
             passes = False
 
+        # Check 6: Language coherence
+        # Chinese text should not contain large blocks of garbled ASCII
+        cjk_ratio = self._cjk_ratio(text[:2000])
+        details["cjk_ratio"] = round(cjk_ratio, 3)
+        if cjk_ratio < 0.05 and len(text) > 500:
+            details["checks"].append(f"very low CJK ratio ({cjk_ratio:.3f}) — possible garbled text")
+            details["failed"] += 1
+            passes = False
+
+        # Check 7: Minimum real content
+        # After stripping whitespace, must have enough meaningful chars
+        stripped = re.sub(r'\s+', '', text)
+        if len(stripped) < 100:
+            details["checks"].append(f"too little real content ({len(stripped)} chars)")
+            details["failed"] += 1
+            passes = False
+
         details["result"] = "PASS" if passes else "FAIL"
         return passes, details
+
+    @staticmethod
+    def _cjk_ratio(text: str) -> float:
+        """Ratio of CJK characters in text (0-1)."""
+        if not text:
+            return 0.0
+        cjk = sum(1 for c in text if '一' <= c <= '鿿')
+        return cjk / len(text)
 
     @staticmethod
     def _has_pua(text: str) -> bool:

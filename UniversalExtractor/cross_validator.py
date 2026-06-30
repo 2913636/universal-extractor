@@ -198,16 +198,53 @@ def align_chapters(
 # 3. 择优合并
 # ============================================================
 
+def _pick_most_consistent(chapters: list[CrawledChapter]) -> CrawledChapter:
+    """Pick the chapter closest to the median char count (most consistent)."""
+    counts = sorted(c.char_count for c in chapters)
+    median = counts[len(counts) // 2]
+    return min(chapters, key=lambda c: abs(c.char_count - median))
+
+
+def _pick_by_voting(chapters: list[CrawledChapter]) -> CrawledChapter:
+    """Pick the chapter most similar to the others (voting by text similarity)."""
+    if len(chapters) <= 2:
+        return max(chapters, key=lambda c: c.char_count)
+
+    scores = []
+    for i, ch in enumerate(chapters):
+        sim_sum = 0.0
+        for j, other in enumerate(chapters):
+            if i == j:
+                continue
+            sim_sum += SequenceMatcher(
+                None,
+                re.sub(r'\s+', '', ch.text[:300])[:200],
+                re.sub(r'\s+', '', other.text[:300])[:200],
+            ).ratio()
+        scores.append(sim_sum)
+
+    best_idx = scores.index(max(scores))
+    return chapters[best_idx]
+
+
 def merge_chapters(
     aligned: list[list[Optional[CrawledChapter]]],
+    strategy: str = "longest",
 ) -> list[MergedChapter]:
     """
-    从对齐矩阵中择优合并：每行选最长版本作为正文。
+    从对齐矩阵中择优合并。
 
-    策略：
-      1. 如果只有一个源有此章 → 直接使用
-      2. 如果多个源有 → 选字数最多的
-      3. 如果字数差距 >30% → 合并两个版本（拼接补充内容）
+    Args:
+        aligned: 章节对齐矩阵
+        strategy: 合并策略
+            - "longest": 每行选字数最多的版本（默认，适合多数场景）
+            - "most_consistent": 选与多数源一致的版本（降低单个源错误的影响）
+            - "voting": 按文本相似度投票，选最像其他源的版本
+
+    策略说明:
+      1. 只有一个源有此章 → 直接使用
+      2. 多个源 → 按策略选择
+      3. 字数差距 >30% → 合并补充内容
     """
     merged = []
 
@@ -223,25 +260,35 @@ def merge_chapters(
             sources_used = [best.source_name]
             confidence = 1.0
         else:
-            # 选最长的
-            best = max(valid, key=lambda c: c.char_count)
+            # Pick best source by strategy
+            if strategy == "most_consistent":
+                best = _pick_most_consistent(valid)
+            elif strategy == "voting":
+                best = _pick_by_voting(valid)
+            else:  # "longest" (default)
+                best = max(valid, key=lambda c: c.char_count)
+
             merged_text = best.text
             sources_used = [best.source_name]
             confidence = 0.9
 
-            # 检查其他版本是否有补充内容
+            # Check other versions for supplementary content (>30% longer)
             for other in valid:
                 if other is best:
                     continue
-                # 如果另一个版本字数明显更多 → 可能包含额外内容
                 if other.char_count > best.char_count * 1.3:
-                    # 拼接到末尾
                     merged_text += "\n\n[补充内容 from " + other.source_name + "]\n" + other.text
                     sources_used.append(other.source_name)
                     confidence = 0.7
                     logger.debug(
                         "Ch%d: merged longer version from %s (%d vs %d chars)",
                         ch_num, other.source_name, other.char_count, best.char_count,
+                    )
+                elif abs(len(other.text) - len(best.text)) > len(best.text) * 0.5:
+                    # Flag significant divergence between sources
+                    logger.debug(
+                        "Ch%d: divergence from %s (%d vs %d chars)",
+                        ch_num, other.source_name, len(other.text), len(best.text),
                     )
 
         # 清理
@@ -296,6 +343,66 @@ def auto_clean(text: str) -> str:
     return text
 
 
+def source_diff_report(
+    aligned: list[list[Optional[CrawledChapter]]],
+) -> dict:
+    """
+    生成跨源差异报告——标注各源之间的不一致处。
+
+    Returns:
+        {
+            "total_chapters": 120,
+            "mismatch_count": 3,       # 内容显著不同的章节数
+            "mismatches": [
+                {"chapter": 5, "reason": "char_count", "values": [3200, 5800, 3400]},
+                ...
+            ],
+            "source_completeness": {"site_a": 118, "site_b": 120, "site_c": 95},
+        }
+    """
+    mismatches = []
+    source_chapters = defaultdict(int)
+
+    for ch_num, row in enumerate(aligned, 1):
+        valid = [c for c in row if c is not None]
+        for c in valid:
+            source_chapters[c.source_name] += 1
+
+        if len(valid) < 2:
+            continue
+
+        # Check char count divergence
+        counts = [c.char_count for c in valid]
+        if max(counts) > min(counts) * 1.5:
+            mismatches.append({
+                "chapter": ch_num,
+                "reason": "char_count",
+                "values": counts,
+                "sources": [c.source_name for c in valid],
+            })
+            continue
+
+        # Check text similarity divergence
+        texts = [re.sub(r'\s+', '', c.text[:300])[:200] for c in valid]
+        for i in range(len(texts)):
+            for j in range(i + 1, len(texts)):
+                sim = SequenceMatcher(None, texts[i], texts[j]).ratio()
+                if sim < 0.5:
+                    mismatches.append({
+                        "chapter": ch_num,
+                        "reason": "low_similarity",
+                        "similarity": round(sim, 3),
+                        "sources": [valid[i].source_name, valid[j].source_name],
+                    })
+
+    return {
+        "total_chapters": len(aligned),
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches,
+        "source_completeness": dict(source_chapters),
+    }
+
+
 # ============================================================
 # 5. 主入口
 # ============================================================
@@ -305,6 +412,7 @@ def cross_validate(
     *,
     max_sources: int = 3,
     headless: bool = True,
+    merge_strategy: str = "longest",
 ) -> dict:
     """
     多源交叉校验主流程。
@@ -313,6 +421,7 @@ def cross_validate(
         query: 搜索关键词（如 "落不下 尤萨阿里塔"）
         max_sources: 最多抓取几个源
         headless: 浏览器是否无头
+        merge_strategy: 合并策略 — "longest" | "most_consistent" | "voting"
 
     Returns:
         {
@@ -364,7 +473,9 @@ def cross_validate(
     print(f"  {len(aligned)} aligned rows")
 
     # Step 4: 合并
-    merged = merge_chapters(aligned)
+    merged = merge_chapters(aligned, strategy=merge_strategy)
+    # Generate diff report
+    diff = source_diff_report(aligned)
 
     total = sum(len(m.text) for m in merged)
 
@@ -375,6 +486,8 @@ def cross_validate(
             name for m in merged for name in m.sources
         )),
         "confidence": sum(m.confidence for m in merged) / len(merged) if merged else 0.0,
+        "diff_report": diff,
+        "merge_strategy": merge_strategy,
     }
 
     print(f"\n[Cross-Validate] Done: {len(merged)} chapters, {total} chars, "
