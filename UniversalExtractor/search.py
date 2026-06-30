@@ -33,35 +33,21 @@ def _http_fetch(
 ) -> Optional[bytes]:
     """
     HTTP request with TLS fingerprint impersonation (curl_cffi).
-    Falls back to urllib if curl_cffi is unavailable.
+    Uses HTTPClient for retry + backoff + urllib fallback.
 
     Returns response body as bytes, or None on failure.
     """
-    # Try curl_cffi first (browser TLS fingerprint)
-    try:
-        from scrapling import Fetcher
+    from .http_client import HTTPClient
 
-        fetcher = Fetcher()
-        fetcher.configure(auto_referer=False, keep_alive=True)
-        if method == "POST":
-            resp = fetcher.post(url, headers=headers or {}, data=data or b"")
-        else:
-            resp = fetcher.get(url, headers=headers or {})
+    client = HTTPClient(timeout=timeout)
+    if method == "POST":
+        resp = client.post(url, data=data, headers=headers)
+    else:
+        resp = client.get(url, headers=headers)
 
-        if resp and resp.content:
-            return resp.content
-    except Exception:
-        pass
-
-    # Fallback to urllib
-    try:
-        import urllib.request
-
-        req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except Exception:
-        return None
+    if resp.ok and resp.content:
+        return resp.content
+    return None
 
 
 # Brave Search 免费 API：https://api.search.brave.com

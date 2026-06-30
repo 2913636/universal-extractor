@@ -760,6 +760,24 @@ class Pipeline:
         self.registry = StageRegistry()
         self.registry.register_defaults()
 
+        # Infrastructure
+        from .http_client import HTTPClient
+        from .rate_limiter import RateLimiter
+        from .proxy_manager import ProxyManager
+        from .session_manager import SessionManager
+
+        self.http = HTTPClient(
+            proxy=self.config.proxy,
+            timeout=self.config.timeout // 1000,  # ms → seconds
+        )
+        self.limiter = RateLimiter(
+            min_interval=self.config.rate_limit_delay,
+        )
+        self.proxy_manager = ProxyManager(
+            proxy_urls=self.config.proxy,
+        )
+        self.sessions = SessionManager()
+
     # ----------------------------------------------------------------
     # Public API
     # ----------------------------------------------------------------
