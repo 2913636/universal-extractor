@@ -73,6 +73,3 @@ UniversalExtractor/
 | 普通 Canvas 页面 | ③ Canvas Hook（rAF 轮询） | ~90% |
 | Canvas 流式文档（WPS/飞书） | ⑤⑥ OCR + Vision LLM | ~70% |
 
-## License
-
-MIT
