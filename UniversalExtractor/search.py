@@ -139,13 +139,23 @@ def _search_exa(query: str, max_results: int = 10) -> list[str]:
 
 def _search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
     """
-    DuckDuckGo HTML search — free, no API key needed.
-    Uses TLS fingerprint impersonation via curl_cffi.
+    DuckDuckGo search — free, no API key needed.
+    Tries Lite HTML first, falls back to Instant Answer API if blocked.
     """
+    urls = _search_ddg_lite(query, max_results)
+    if urls:
+        return urls
+    # DDG may be blocking; try Instant Answer as last resort
+    logger.info("DuckDuckGo: Lite returned 0 results, trying Instant API")
+    return _search_ddg_instant(query, max_results)
+
+
+def _search_ddg_lite(query: str, max_results: int = 10) -> list[str]:
+    """DuckDuckGo Lite HTML search."""
     try:
         params = urllib.parse.urlencode({"q": query})
         body = _http_fetch(
-            f"https://html.duckduckgo.com/html/?{params}",
+            f"https://lite.duckduckgo.com/lite/?{params}",
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -161,26 +171,87 @@ def _search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
 
         html = body.decode("utf-8", errors="replace")
 
-        # DuckDuckGo 用 uddg= 参数编码目标 URL
-        # 格式: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com
-        encoded_urls = re.findall(r"uddg=([^\"'&\s]+)", html)
+        # Check for CAPTCHA
+        if "please complete the following challenge" in html.lower():
+            logger.debug("DuckDuckGo: CAPTCHA challenge detected")
+            return []
 
-        # URL 解码并去重（保持顺序）
-        seen = set()
+        # Extract result links from Lite page
+        # Lite format: <a rel="nofollow" href="https://example.com" class="result-link">
         urls = []
-        for eu in encoded_urls:
-            try:
-                decoded = urllib.parse.unquote(eu)
-                if decoded not in seen:
-                    seen.add(decoded)
-                    urls.append(decoded)
-            except Exception:
-                pass
+        seen = set()
+        for m in re.finditer(
+            r'<a[^>]+class="result-link"[^>]+href="([^"]+)"',
+            html, re.IGNORECASE,
+        ):
+            url = m.group(1)
+            if url and url not in seen and not url.startswith("//"):
+                seen.add(url)
+                urls.append(url)
 
-        logger.info("DuckDuckGo: %d results for '%s'", len(urls), query[:50])
+        # Also try uddg= redirect format
+        if not urls:
+            encoded_urls = re.findall(r"uddg=([^\"'&\s]+)", html)
+            for eu in encoded_urls:
+                try:
+                    decoded = urllib.parse.unquote(eu)
+                    if decoded not in seen:
+                        seen.add(decoded)
+                        urls.append(decoded)
+                except Exception:
+                    pass
+
+        logger.info("DuckDuckGo Lite: %d results for '%s'", len(urls), query[:50])
         return urls[:max_results]
     except Exception as exc:
-        logger.debug("DuckDuckGo error: %s", exc)
+        logger.debug("DuckDuckGo Lite error: %s", exc)
+        return []
+
+
+def _search_ddg_instant(query: str, max_results: int = 10) -> list[str]:
+    """
+    DuckDuckGo Instant Answer API.
+    Returns related topics and external links from knowledge graph.
+    """
+    try:
+        params = urllib.parse.urlencode({
+            "q": query,
+            "format": "json",
+            "no_html": "1",
+            "skip_disambig": "1",
+        })
+        body = _http_fetch(
+            f"https://api.duckduckgo.com/?{params}",
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if not body:
+            return []
+
+        import json
+        data = json.loads(body)
+
+        urls = []
+        seen = set()
+
+        # Related topics often have FirstURL
+        for topic in data.get("RelatedTopics", []):
+            url = topic.get("FirstURL", "")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+        # Also check Results (external links)
+        for item in data.get("Results", []):
+            url = item.get("FirstURL", "")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+        logger.info("DuckDuckGo Instant: %d results for '%s'", len(urls), query[:50])
+        return urls[:max_results]
+    except Exception as exc:
+        logger.debug("DuckDuckGo Instant error: %s", exc)
         return []
 
 
@@ -273,7 +344,7 @@ def search_with_metadata(
         }
     """
     if backends is None:
-        backends = ["brave", "exa", "duckduckgo", "searxng"]
+        backends = ["searxng", "brave", "exa", "duckduckgo"]
 
     search_query = query
     if site_filter:
@@ -361,7 +432,7 @@ async def search_with_metadata_async(
     2-3x faster than the sync version when multiple backends are used.
     """
     if backends is None:
-        backends = ["brave", "exa", "duckduckgo", "searxng"]
+        backends = ["searxng", "brave", "exa", "duckduckgo"]
 
     search_query = query
     if site_filter:
