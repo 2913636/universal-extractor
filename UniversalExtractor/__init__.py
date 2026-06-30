@@ -41,6 +41,10 @@ from .ocr_providers import (
 from .search import search_urls, is_likely_content_url
 from .classifier import classify_url, score_content, match_keywords
 from .weblens import WebLens, WebLensResult
+from .http_client import HTTPClient, HTTPResponse
+from .rate_limiter import RateLimiter
+from .proxy_manager import ProxyManager
+from .session_manager import SessionManager
 from .pipeline import (
     Pipeline,
     PipelineConfig,
@@ -85,6 +89,12 @@ __all__ = [
     # WebLens
     "WebLens",
     "WebLensResult",
+    # Infrastructure
+    "HTTPClient",
+    "HTTPResponse",
+    "RateLimiter",
+    "ProxyManager",
+    "SessionManager",
     # Search
     "search_urls",
     "is_likely_content_url",
