@@ -86,14 +86,18 @@ class PipelineStageResult:
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        self._sync()
+
+    def _sync(self):
+        """Keep char_count and success in sync with text."""
         if self.text:
             self.char_count = len(self.text)
             self.success = True
-        if self.text and self.completeness == 0.0:
-            try:
-                self.completeness = completeness_score(self.text)
-            except Exception:
-                pass
+            if self.completeness == 0.0:
+                try:
+                    self.completeness = completeness_score(self.text)
+                except Exception:
+                    pass
 
 
 @dataclass
@@ -300,7 +304,7 @@ class JinaReaderStage(ExtractionStage):
 
             if text and len(text) > 50:
                 result.text = text
-                result.success = True
+                result._sync()
                 context.html_body = text
 
         except Exception as exc:
@@ -349,7 +353,7 @@ class CurlCffiStage(ExtractionStage):
 
         try:
             fetcher = Fetcher()
-            fetcher.configure(auto_referer=False, keep_alive=True)
+            # keep_alive and auto_referer set via Fetcher defaults
 
             # Follow redirects (max 5 hops)
             current_url = url
@@ -395,7 +399,7 @@ class CurlCffiStage(ExtractionStage):
 
                 if text and len(text) > 100:
                     result.text = text
-                    result.success = True
+                    result._sync()
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -577,7 +581,7 @@ class BrowserDomStage(ExtractionStage):
 
             if all_text.strip():
                 result.text = all_text.strip()
-                result.success = True
+                result._sync()
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -652,7 +656,7 @@ class CanvasHookStage(ExtractionStage):
                 text = "\n".join(unique)
                 if len(text) > 100:
                     result.text = text
-                    result.success = True
+                    result._sync()
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -725,7 +729,7 @@ class CdpHeapStage(ExtractionStage):
                 text = "\n".join(texts)
                 if len(text) > 200:
                     result.text = text
-                    result.success = True
+                    result._sync()
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -800,7 +804,7 @@ class ScreenshotOcrStage(ExtractionStage):
 
             if all_text:
                 result.text = "\n---\n".join(all_text)
-                result.success = True
+                result._sync()
                 result.metadata["ocr_confidence"] = best_conf
 
         except Exception as exc:
@@ -893,7 +897,7 @@ class VisionLlmStage(ExtractionStage):
                     models_tried.append({"model": provider_name, "chars": len(text) if text else 0})
                     if text and len(text) > 200:
                         result.text = text
-                        result.success = True
+                        result._sync()
                         # Estimate cost
                         result.metadata["models_tried"] = models_tried
                         result.metadata["estimated_tokens"] = len(text) // 4  # rough estimate
@@ -1472,13 +1476,14 @@ class Pipeline:
             passes = False
 
         # Check 6: Language coherence
-        # Chinese text should not contain large blocks of garbled ASCII
-        cjk_ratio = self._cjk_ratio(text[:2000])
-        details["cjk_ratio"] = round(cjk_ratio, 3)
-        if cjk_ratio < 0.05 and len(text) > 500:
-            details["checks"].append(f"very low CJK ratio ({cjk_ratio:.3f}) — possible garbled text")
-            details["failed"] += 1
-            passes = False
+        # Only for CJK queries — English content should not be rejected for low CJK ratio
+        if keyword and any('一' <= c <= '鿿' for c in keyword[:10]):
+            cjk_ratio = self._cjk_ratio(text[:2000])
+            details["cjk_ratio"] = round(cjk_ratio, 3)
+            if cjk_ratio < 0.05 and len(text) > 500:
+                details["checks"].append(f"very low CJK ratio ({cjk_ratio:.3f})")
+                details["failed"] += 1
+                passes = False
 
         # Check 7: Minimum real content
         # After stripping whitespace, must have enough meaningful chars

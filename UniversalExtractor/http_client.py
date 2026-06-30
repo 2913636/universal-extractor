@@ -114,7 +114,7 @@ class HTTPClient:
         for attempt in range(self.max_retries):
             try:
                 fetcher = Fetcher()
-                fetcher.configure(auto_referer=False, keep_alive=True)
+                # Fetcher() uses defaults for keep_alive and auto_referer
 
                 if method == "POST":
                     resp = fetcher.post(
