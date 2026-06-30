@@ -14,9 +14,11 @@ WebLens 把两者拼起来，加上智能筛选。
 
 from __future__ import annotations
 
+import re
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urljoin
 
 from .extractor import UniversalExtractor
 from .completeness import completeness_score
@@ -24,6 +26,41 @@ from .search import search_urls
 from .classifier import classify_url, score_content, match_keywords
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# Shared constants（跨模块复用，减少选择器/JS 重复）
+# ============================================================
+
+# 小说章节正文的 CSS 选择器优先级列表
+_CHAPTER_SELECTORS = [
+    "#chaptercontent", "#content", ".chapter-content",
+    "#booktxt", "#txt", ".showtxt", ".read-content", "#TextContent",
+    "article", "#htmlContent", ".article-content",
+    ".novel-content", "#nr1", "#booktext",
+]
+
+# 页面导航检测 JS（区分"下一页"和"下一章"）
+_PAGE_NAV_JS = """() => {
+    var r = {next_page: '', next_chapter: ''};
+    var links = document.querySelectorAll('a');
+    for (var i = 0; i < links.length; i++) {
+        var a = links[i];
+        var t = (a.innerText || a.textContent || '').trim();
+        var h = a.getAttribute('href') || '';
+        if (!h || h.startsWith('javascript:') || h === '#') continue;
+        if (/^下一页$|^下一頁$/.test(t) && !r.next_page) r.next_page = h;
+        if (/下一章|下一节/.test(t) && !r.next_chapter) r.next_chapter = h;
+    }
+    return r;
+}"""
+
+# 字体加密检测：Unicode 私用区 (PUA) 区间
+# 网站用自定义字体把中文字符映射到 PUA 码点来反爬
+_FONT_ENCRYPT_RANGES = [
+    (0xE000, 0xF8FF),   # BMP Private Use Area
+    (0xF0000, 0xFFFFD), # Supplementary PUA-A
+    (0x100000, 0x10FFFD), # Supplementary PUA-B
+]
 
 
 # ============================================================
@@ -69,8 +106,6 @@ def _guess_chapter_url(base_url: str, chapter_num: int) -> str:
       /book/123.html → /book/124.html (递增)
       /book/123/ → /book/1/ (用章节号)
     """
-    import re
-
     # 模式 1：URL 以数字结尾 → 替换为章节号
     m = re.match(r"(.+/)(\d+)(\.html?)?$", base_url)
     if m:
@@ -84,6 +119,23 @@ def _guess_chapter_url(base_url: str, chapter_num: int) -> str:
     # 模式 3：拼接 chapter/N
     base = base_url.rstrip("/")
     return f"{base}/{chapter_num}.html"
+
+
+def _has_font_encryption(text: str) -> bool:
+    """
+    检测文本中是否含字体加密字符（Unicode PUA 码点）。
+
+    很多小说站用自定义字体把中文字符映射到私用区（PUA），
+    导致提取到的文本是一堆乱码符号。此函数检测这种情况。
+    """
+    if not text:
+        return False
+    # 快速抽样：检查前 2000 字符
+    sample = text[:2000]
+    for start, end in _FONT_ENCRYPT_RANGES:
+        if any(ord(c) >= start and ord(c) <= end for c in sample):
+            return True
+    return False
 
 
 @dataclass
@@ -232,6 +284,74 @@ class WebLens:
         return result
 
     # --------------------------------------------------------
+    # Intra-chapter pagination
+    # --------------------------------------------------------
+
+    @staticmethod
+    def follow_chapter_pages(page, max_pages: int = 10) -> list[str]:
+        """
+        跟踪章节内分页：检测当前页是否有"下一页"（同章翻页），
+        有则持续跟随直到遇到"下一章"（跨章）或到底。
+
+        返回每页的正文列表。
+
+        Args:
+            page: Playwright Page 对象（已加载的页面）
+            max_pages: 最大跟踪页数，防止死循环
+
+        Returns:
+            每页正文文本的列表
+        """
+        pages_text = []
+
+        for _ in range(max_pages):
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            # Extract text（使用统一的共享选择器）
+            sels_js = ",".join(_CHAPTER_SELECTORS)
+            text = page.evaluate(f"""() => {{
+                var sels = {sels_js!r}.split(',');
+                for (var j = 0; j < sels.length; j++) {{
+                    var el = document.querySelector(sels[j]);
+                    if (el && el.innerText && el.innerText.trim().length > 50)
+                        return el.innerText.trim();
+                }}
+                return (document.body && document.body.innerText)
+                    ? document.body.innerText.trim() : '';
+            }}""") or ""
+
+            if text:
+                text = re.sub(
+                    r'(加入书架|收藏|推荐|分享|打赏|举报|书签|手机版|电脑版|下载|安装).*',
+                    '', text,
+                )
+                pages_text.append(text)
+
+            # Check navigation（使用统一的共享 JS）
+            nav = page.evaluate(_PAGE_NAV_JS)
+            next_page = nav.get("next_page", "")
+            next_chapter = nav.get("next_chapter", "")
+
+            # 优先检查"下一章"——有就说明当前章节结束
+            if next_chapter:
+                break
+            # 只有"下一页"（同章翻页）才继续
+            if next_page:
+                try:
+                    new_url = urljoin(page.url, next_page)
+                    page.goto(new_url, wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    break
+            else:
+                break
+
+        return pages_text
+
+    # --------------------------------------------------------
     # Novel chapter following
     # --------------------------------------------------------
 
@@ -245,7 +365,6 @@ class WebLens:
         if not text or len(text) < 200:
             return False
 
-        import re
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
         # 章节标记数量
@@ -279,8 +398,6 @@ class WebLens:
         Returns:
             [{"num": 1, "title": "疯狂年代", "url": "https://..."}, ...]
         """
-        import re
-        from urllib.parse import urljoin
 
         chapters = []
 
@@ -360,8 +477,6 @@ class WebLens:
         用真浏览器加载目录页 → 从 DOM 提取章节链接
         → 跟进第一章 → 提取正文。
         """
-        import re
-
         # Step 1: 用真浏览器加载目录页，从 DOM 提取章节链接
         from scrapling import StealthyFetcher
         chapter_links = []
@@ -420,37 +535,20 @@ class WebLens:
         chapter_title = first.get("text", "")[:60]
 
         # Resolve relative URL
-        from urllib.parse import urljoin
         if not chapter_url.startswith("http"):
             chapter_url = urljoin(base_url, chapter_url)
 
         print(f"  Chapter: {chapter_title}")
         print(f"  URL: {chapter_url[:100]}")
 
-        # Step 2: 抓第一章正文
+        # Step 2: 抓第一章正文（含章节内分页跟踪）
         try:
-            collected = []
+            collected_pages = []
 
             def extract_content(page):
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-                page.wait_for_timeout(2000)
-                text = page.evaluate("""() => {
-                    // 尝试正文选择器
-                    var sel = document.querySelector(
-                        '#content, .content, .chapter-content, ' +
-                        '#chaptercontent, .article-content, ' +
-                        '#booktxt, #txt, .showtxt, #TextContent, ' +
-                        'article, .novel-content, .read-content'
-                    );
-                    if (sel && sel.innerText && sel.innerText.trim().length > 200) {
-                        return sel.innerText.trim();
-                    }
-                    var body = document.body;
-                    if (!body || !body.innerText) return '';
-                    return body.innerText.trim();
-                }""")
-                if text:
-                    collected.append(text)
+                # 使用统一的章节分页跟踪，自动处理多页
+                pages = WebLens.follow_chapter_pages(page)
+                collected_pages.extend(pages)
 
             StealthyFetcher.fetch(
                 chapter_url,
@@ -460,7 +558,7 @@ class WebLens:
                 network_idle=False,
             )
 
-            chapter_text = collected[0] if collected else ""
+            chapter_text = "\n\n".join(collected_pages) if collected_pages else ""
             return chapter_text, chapter_url
         except Exception as exc:
             logger.warning("Chapter extract failed: %s", exc)
@@ -575,6 +673,11 @@ class WebLens:
                         text = "\n".join(lines[i + 1:])
                         break
 
+            # 字体加密检测：PUA 码点 → 返回空触发浏览器降级
+            if _has_font_encryption(text):
+                logger.debug("Jina: font encryption detected for %s, returning empty", url[:60])
+                return ""
+
             logger.debug("Jina: %d chars from %s", len(text), url[:60])
             return text.strip() if text else ""
         except Exception as exc:
@@ -615,7 +718,10 @@ class WebLens:
         except Exception:
             pass
 
-        return collected[0] if collected else ""
+        text = collected[0] if collected else ""
+        if _has_font_encryption(text):
+            logger.warning("Browser: font encryption detected for %s", url[:60])
+        return text
 
     # --------------------------------------------------------
     # 便捷方法

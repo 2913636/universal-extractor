@@ -24,6 +24,18 @@ from enum import Enum
 from typing import Optional
 
 # ============================================================
+# 共享常量
+# ============================================================
+
+# 统一 boilerplate 关键词——同时被 score_content() 和 completeness.py 使用
+BOILERPLATE_KEYWORDS = [
+    "登录", "login", "注册", "register", "copyright", "cookie",
+    "隐私", "privacy", "条款", "Sign in",
+    "验证码", "验证", "请登录后", "登录后查看", "立即登录",
+    "请先登录", "需要登录", "密码", "password",
+]
+
+# ============================================================
 # URL 噪声模式
 # ============================================================
 
@@ -287,10 +299,7 @@ def score_content(
 
     # 噪声惩罚
     top = text[:500].lower()
-    boilerplate = ["登录", "注册", "copyright", "cookie", "隐私", "privacy",
-                   "验证码", "验证", "请登录后", "登录后查看", "立即登录",
-                   "请先登录", "需要登录", "密码", "password"]
-    hits = sum(1 for kw in boilerplate if kw in top)
+    hits = sum(1 for kw in BOILERPLATE_KEYWORDS if kw.lower() in top)
     if hits >= 3:
         quality -= 0.25
         result["signals"].append("boilerplate_dense")

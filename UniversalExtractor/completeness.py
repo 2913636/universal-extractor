@@ -15,14 +15,11 @@ import re
 from typing import Dict, Optional
 
 # --- 阈值常量 ---
+from .classifier import BOILERPLATE_KEYWORDS  # 统一噪声关键词
+
 MIN_TEXT_LENGTH = 100
 MIN_PARAGRAPHS = 3
 MIN_SENTENCE_MARKERS = 10
-
-BOILERPLATE_KEYWORDS = [
-    "登录", "login", "注册", "register", "copyright",
-    "cookie", "隐私", "privacy", "条款", "Sign in",
-]
 
 # 常见 loading 骨架文案（长度短，多是 UI 框架默认文本）
 SKELETON_PATTERNS = [
