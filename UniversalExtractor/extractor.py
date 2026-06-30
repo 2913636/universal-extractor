@@ -222,7 +222,29 @@ class UniversalExtractor:
     # --------------------------------------------------------
 
     def extract(self, url: str) -> str:
-        """Run the 6-layer fallback chain and return the best text."""
+        """Run the full fallback chain and return the best text.
+
+        Delegates to Pipeline.run() for the 7-stage fallback chain.
+        Falls back to the original 6-layer chain on Pipeline failure.
+        """
+        # Try new Pipeline first
+        try:
+            from .pipeline import Pipeline, PipelineConfig
+            pipeline = Pipeline(PipelineConfig(
+                headless=self.headless,
+                timeout=self.timeout,
+            ))
+            result = pipeline.run(url=url, mode="extract_only")
+            if result.success and result.text:
+                print(f"Pipeline: {result.winning_stage} (score={result.score:.2f})")
+                return result.text.strip()
+        except Exception as exc:
+            logger.debug("Pipeline failed, falling back to legacy chain: %s", exc)
+
+        # Legacy fallback: original 6-layer chain
+        return self._extract_legacy(url)
+
+    def _extract_legacy(self, url: str) -> str:
         self._temp_root = Path(tempfile.mkdtemp(prefix="ue_"))
         profile_dir = Path(tempfile.mkdtemp(prefix="ue_profile_"))
         results: list[ExtractionResult] = []

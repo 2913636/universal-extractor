@@ -200,6 +200,9 @@ class WebLens:
         """
         搜索 → 快速筛选 → 全链抓取的最佳结果。
 
+        Delegates to Pipeline.run() for the full closed-loop pipeline.
+        Falls back to legacy WebLens logic on Pipeline failure.
+
         Args:
             query: 搜索关键词（如 "三体 小说 全文"）
             site_filter: 限定站点
@@ -209,6 +212,34 @@ class WebLens:
         Returns:
             WebLensResult
         """
+        # Try new Pipeline first
+        try:
+            from .pipeline import Pipeline, PipelineConfig
+            pipeline = Pipeline(PipelineConfig(
+                headless=self.headless,
+                timeout=self.timeout,
+                quick_scan_timeout=self.quick_scan_timeout,
+                min_completeness=self.min_score,
+                max_candidates=self.max_candidates,
+                site_filter=site_filter,
+            ))
+            pr = pipeline.run(query=query, keyword_hint=keyword_hint)
+            if pr.success and pr.text:
+                return WebLensResult(
+                    url=pr.url or "",
+                    text=pr.text,
+                    score=pr.score,
+                    method=pr.winning_stage,
+                    source_layer=next(
+                        (s.stage_index for s in pr.extraction_chain
+                         if s.stage_name == pr.winning_stage), 0),
+                    candidates_scanned=pr.search_candidates_scanned,
+                    candidates_total=pr.search_candidates_total,
+                )
+        except Exception as exc:
+            logger.debug("Pipeline failed, using legacy WebLens: %s", exc)
+
+        # Legacy fallback
         result = WebLensResult()
 
         # ---- Step 1: Search ----

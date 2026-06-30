@@ -1,22 +1,23 @@
 """
 UniversalExtractor — 通用网页内容提取器。
 
-6 层降级链，自动选择最佳策略提取正文：
-  ① DOM 提取 → ② API 拦截 → ③ Canvas Hook → ④ CDP 扫描 → ⑤ 截图 OCR → ⑥ Vision LLM 全页
+7 级降级链 + 闭环搜索验证:
+  Jina Reader → curl_cffi HTTP → Browser DOM → Canvas Hook
+  → CDP Heap → Screenshot OCR → Vision LLM
 
-用法:
+Pipeline — 闭环编排:
+    from universal_extractor import Pipeline
+
+    pipeline = Pipeline()
+    result = pipeline.run("三体 小说 全文")
+    print(result.text)
+
+UniversalExtractor — 直接提取:
     from universal_extractor import UniversalExtractor, ExtractionError
 
-    ue = UniversalExtractor(headless=False)  # 自动检测可用的 Vision 后端
+    ue = UniversalExtractor(headless=False)
     text = ue.extract("https://example.com/article")
     print(text)
-
-JD 抓取引擎:
-    from universal_extractor import JDEngine
-
-    engine = JDEngine(headless=False)
-    jd = engine.fetch_jd("https://www.zhipin.com/job_detail/xxx.html")
-    print(jd.title, jd.requirements)
 
 WebLens — 搜 + 筛 + 抓:
     from universal_extractor import WebLens
@@ -40,18 +41,54 @@ from .ocr_providers import (
 from .search import search_urls, is_likely_content_url
 from .classifier import classify_url, score_content, match_keywords
 from .weblens import WebLens, WebLensResult
+from .pipeline import (
+    Pipeline,
+    PipelineConfig,
+    PipelineResult,
+    PipelineStageResult,
+    StageContext,
+    StageRegistry,
+    ExtractionStage,
+    JinaReaderStage,
+    CurlCffiStage,
+    BrowserDomStage,
+    CanvasHookStage,
+    CdpHeapStage,
+    ScreenshotOcrStage,
+    VisionLlmStage,
+)
 
 __all__ = [
+    # Core
     "UniversalExtractor",
     "ExtractionError",
     "ExtractionResult",
+    # Pipeline
+    "Pipeline",
+    "PipelineConfig",
+    "PipelineResult",
+    "PipelineStageResult",
+    "StageContext",
+    "StageRegistry",
+    "ExtractionStage",
+    "JinaReaderStage",
+    "CurlCffiStage",
+    "BrowserDomStage",
+    "CanvasHookStage",
+    "CdpHeapStage",
+    "ScreenshotOcrStage",
+    "VisionLlmStage",
+    # JD
     "JDEngine",
     "JDResult",
     "PLATFORM_CONFIG",
+    # WebLens
     "WebLens",
     "WebLensResult",
+    # Search
     "search_urls",
     "is_likely_content_url",
+    # Vision
     "VisionProvider",
     "OpenAIProvider",
     "AnthropicProvider",
