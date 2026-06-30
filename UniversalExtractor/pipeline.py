@@ -497,6 +497,49 @@ class BrowserDomStage(ExtractionStage):
                 # 保存 page 引用供后续阶段使用
                 context._page = page
 
+                # Captcha detection
+                captcha_js = (
+                    "(() => { return JSON.stringify({ detected: !!(document.querySelector('.g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey]')), siteKey: (document.querySelector('[data-sitekey]') || {}).getAttribute?.('data-sitekey') || '' }); })()"
+                )
+                try:
+                    captcha_info = page.evaluate(captcha_js)
+                    captcha_data = __import__('json').loads(captcha_info)
+                    if captcha_data.get("detected"):
+                        result.metadata["captcha_detected"] = True
+                        result.metadata["captcha_site_key"] = captcha_data.get("siteKey", "")
+                        logger.info("BrowserDomStage: captcha detected at %s", url[:80])
+                        # Try solving if solver is available
+                        from .captcha_solver import CaptchaSolver
+                        solver = CaptchaSolver()
+                        if solver.available and captcha_data.get("siteKey"):
+                            captcha_result = solver.solve_recaptcha_v2(
+                                captcha_data["siteKey"], url,
+                            )
+                            if captcha_result.solved:
+                                page.evaluate(f"""
+                                    document.getElementById('g-recaptcha-response').value = '{captcha_result.token}';
+                                    if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                                        var cb = ___grecaptcha_cfg.clients[0];
+                                        if (cb) cb.callback('{captcha_result.token}');
+                                    }}
+                                """)
+                                page.wait_for_timeout(1000)
+                                # Re-extract after captcha
+                                retry_text = page.evaluate(f"""() => {{
+                                    var sels = {sel_js!r}.split(',');
+                                    for (var j = 0; j < sels.length; j++) {{
+                                        var el = document.querySelector(sels[j]);
+                                        if (el && el.innerText && el.innerText.trim().length > 50)
+                                            return el.innerText.trim();
+                                    }}
+                                    return '';
+                                }}""") or ""
+                                if retry_text:
+                                    collected.append(retry_text)
+                                    result.metadata["captcha_solved"] = True
+                except Exception:
+                    pass
+
             # Anti-bot hardening
             domain = url.split("/")[2] if "://" in url else url
             fetch_kwargs = {
@@ -1203,6 +1246,12 @@ class Pipeline:
                 preview = await loop.run_in_executor(None, _fetch)
 
                 if not preview or len(preview.strip()) < self.config.min_preview_chars:
+                    # Check if it is a captcha page
+                    from .captcha_solver import CaptchaSolver
+                    captcha = CaptchaSolver.detect_captcha(preview or "")
+                    if captcha.detected:
+                        logger.info("Verify: captcha detected at %s (type=%s)",
+                                    url[:60], captcha.captcha_type)
                     return None
 
                 scored = score_content(preview, url=url, keyword=keyword)
@@ -1300,6 +1349,11 @@ class Pipeline:
                 continue
 
             if not preview or len(preview.strip()) < self.config.min_preview_chars:
+                from .captcha_solver import CaptchaSolver
+                captcha = CaptchaSolver.detect_captcha(preview or "")
+                if captcha.detected:
+                    logger.info("Verify: captcha detected at %s (type=%s)",
+                                url[:60], captcha.captcha_type)
                 continue
 
             # 评分
