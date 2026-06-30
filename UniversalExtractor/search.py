@@ -183,6 +183,58 @@ def _search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
         return []
 
 
+def _search_searxng(query: str, max_results: int = 10) -> list[str]:
+    """
+    SearXNG — self-hosted meta search engine.
+    Aggregates results from Google, Bing, DuckDuckGo, etc.
+
+    Set SEARXNG_URL env var to your instance, e.g.:
+        SEARXNG_URL=https://searx.example.com
+
+    Requires zero API keys. The instance owner controls which
+    upstream engines are queried.
+    """
+    searx_url = os.getenv("SEARXNG_URL", "")
+    if not searx_url:
+        logger.debug("SearXNG: no SEARXNG_URL configured, skipping")
+        return []
+
+    try:
+        import json
+
+        api_url = f"{searx_url.rstrip('/')}/search"
+        params = urllib.parse.urlencode({
+            "q": query,
+            "format": "json",
+            "categories": "general",
+            "language": "zh-CN",
+            "pageno": 1,
+        })
+        body = _http_fetch(
+            f"{api_url}?{params}",
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        if not body:
+            return []
+
+        data = json.loads(body)
+
+        urls = []
+        seen = set()
+        for item in data.get("results", []):
+            url = item.get("url", "")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+        logger.info("SearXNG: %d results for '%s'", len(urls), query[:50])
+        return urls[:max_results]
+    except Exception as exc:
+        logger.debug("SearXNG error: %s", exc)
+        return []
+
+
 def search_urls(
     query: str,
     max_results: int = 15,
@@ -220,7 +272,7 @@ def search_with_metadata(
         }
     """
     if backends is None:
-        backends = ["brave", "exa", "duckduckgo"]
+        backends = ["brave", "exa", "duckduckgo", "searxng"]
 
     search_query = query
     if site_filter:
@@ -240,6 +292,8 @@ def search_with_metadata(
                 results = _search_exa(query, max_results)
             elif backend == "duckduckgo":
                 results = _search_duckduckgo(search_query, max_results)
+            elif backend == "searxng":
+                results = _search_searxng(query, max_results)
             else:
                 logger.warning("Unknown search backend: %s", backend)
                 continue
