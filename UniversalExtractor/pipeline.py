@@ -179,6 +179,9 @@ class StageContext:
     # --- Tracked results ---
     stage_results: list[PipelineStageResult] = field(default_factory=list)
 
+    # --- Pipeline back-reference (set by Pipeline.run()) ---
+    _pipeline: Any = None
+
     @property
     def best_completeness(self) -> float:
         scores = [s.completeness for s in self.stage_results if s.success]
@@ -330,7 +333,7 @@ class CurlCffiStage(ExtractionStage):
         result = PipelineStageResult(stage_name=self.stage_name,
                                       stage_index=self.stage_index)
 
-        # 如果 Jina 已拿到足够内容，跳过
+        # Skip if Jina already got enough
         if context.best_completeness >= context.config.min_completeness:
             result.metadata["skipped"] = "previous stage sufficient"
             result.timing_ms = 0
@@ -346,7 +349,18 @@ class CurlCffiStage(ExtractionStage):
         try:
             fetcher = Fetcher()
             fetcher.configure(auto_referer=False, keep_alive=True)
-            resp = fetcher.fetch(url)
+
+            # Follow redirects (max 5 hops)
+            current_url = url
+            for _ in range(5):
+                resp = fetcher.fetch(current_url)
+                if resp and resp.status_code in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("Location") or resp.headers.get("location")
+                    if loc:
+                        from urllib.parse import urljoin as _urljoin
+                        current_url = _urljoin(current_url, loc)
+                        continue
+                break
 
             if not resp or not resp.text:
                 result.error = "empty response"
@@ -354,14 +368,33 @@ class CurlCffiStage(ExtractionStage):
                 return result
 
             html = resp.text
+            # Truncate oversized responses (>5MB → keep first 1MB)
+            if len(html) > 5 * 1024 * 1024:
+                logger.debug("CurlCffiStage: truncating %d bytes → 1MB", len(html))
+                html = html[:1 * 1024 * 1024]
+
             context.html_body = html
             context.html_headers = dict(resp.headers) if resp.headers else {}
 
-            # 用简易选择器提取正文
+            # Auto encoding detection
             text = self._extract_text(html)
             if text and len(text) > 100:
-                result.text = text
-                result.success = True
+                # Try chardet if text looks garbled
+                if self._looks_garbled(text):
+                    try:
+                        import chardet
+                        detected = chardet.detect(resp.content or b"")
+                        if detected and detected.get("encoding"):
+                            text = (resp.content or b"").decode(
+                                detected["encoding"], errors="replace"
+                            )
+                            text = self._extract_text(text)
+                    except ImportError:
+                        pass
+
+                if text and len(text) > 100:
+                    result.text = text
+                    result.success = True
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -369,6 +402,14 @@ class CurlCffiStage(ExtractionStage):
 
         result.timing_ms = int((time.time() - t0) * 1000)
         return result
+
+    @staticmethod
+    def _looks_garbled(text: str) -> bool:
+        """Check if text looks like mojibake (garbled encoding)."""
+        sample = text[:500]
+        # Count replacement chars and isolated high bytes
+        bad = sum(1 for c in sample if c in '�\x00' or ord(c) > 0xFFFF)
+        return bad > len(sample) * 0.1
 
     @staticmethod
     def _extract_text(html: str) -> str:
@@ -455,14 +496,35 @@ class BrowserDomStage(ExtractionStage):
                 # 保存 page 引用供后续阶段使用
                 context._page = page
 
-            StealthyFetcher.fetch(
-                url,
-                headless=context.config.headless,
-                timeout=context.config.timeout,
-                page_setup=setup,
-                page_action=action,
-                network_idle=False,
-            )
+            # Anti-bot hardening
+            domain = url.split("/")[2] if "://" in url else url
+            fetch_kwargs = {
+                "headless": context.config.headless,
+                "timeout": context.config.timeout,
+                "page_setup": setup,
+                "page_action": action,
+                "network_idle": False,
+                # Anti-bot features
+                "solve_cloudflare": True,
+                "block_webrtc": True,
+                "dns_over_https": True,
+            }
+
+            # Proxy
+            proxy = None
+            if hasattr(context, '_pipeline') and context._pipeline:
+                proxy = context._pipeline.proxy_manager.get_proxy()
+            if proxy:
+                fetch_kwargs["proxy"] = proxy
+
+            # Session persistence
+            session_dir = None
+            if hasattr(context, '_pipeline') and context._pipeline:
+                session_dir = context._pipeline.sessions.get_profile(domain)
+            if session_dir:
+                fetch_kwargs["user_data_dir"] = str(session_dir)
+
+            StealthyFetcher.fetch(url, **fetch_kwargs)
 
             # 合并 DOM + API 响应
             all_text = "\n\n".join(collected)
@@ -636,7 +698,7 @@ class CdpHeapStage(ExtractionStage):
 class ScreenshotOcrStage(ExtractionStage):
     stage_name = "screenshot_ocr"
     stage_index = 5
-    description = "截图 + OCR — 对付 Canvas/图片渲染的页面。"
+    description = "Screenshot + OCR — for Canvas/image-rendered pages."
 
     def extract(self, url: str, context: StageContext) -> PipelineStageResult:
         t0 = time.time()
@@ -654,6 +716,9 @@ class ScreenshotOcrStage(ExtractionStage):
 
             page = context._page
             screenshots = capture_views(page)
+
+            # Pixel-hash dedup: remove near-duplicate screenshots
+            screenshots = self._dedup_screenshots(screenshots)
             context.screenshot_paths = screenshots
 
             if not screenshots:
@@ -668,19 +733,31 @@ class ScreenshotOcrStage(ExtractionStage):
                 return result
 
             all_text = []
-            for path in screenshots[:5]:  # 最多 5 张
-                for provider in providers[:2]:  # 每个截图试 2 个 provider
+            for path in screenshots[:5]:
+                best_text = ""
+                best_conf = 0
+                for provider in providers[:2]:
                     try:
-                        text = provider.extract_text(path)
+                        ocr_result = provider.extract_text(path)
+                        if isinstance(ocr_result, tuple):
+                            text, conf = ocr_result
+                        else:
+                            text, conf = ocr_result, 0.5
                         if text and len(text) > 50:
-                            all_text.append(text)
-                            break
+                            if conf > best_conf:
+                                best_text = text
+                                best_conf = conf
+                            if conf > 0.6:  # Good enough, don't try other providers
+                                break
                     except Exception:
                         continue
+                if best_text and best_conf > 0.4:
+                    all_text.append(best_text)
 
             if all_text:
                 result.text = "\n---\n".join(all_text)
                 result.success = True
+                result.metadata["ocr_confidence"] = best_conf
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -688,6 +765,40 @@ class ScreenshotOcrStage(ExtractionStage):
 
         result.timing_ms = int((time.time() - t0) * 1000)
         return result
+
+    @staticmethod
+    def _dedup_screenshots(paths: list[str]) -> list[str]:
+        """Remove near-duplicate screenshots based on perceptual hash."""
+        if len(paths) <= 1:
+            return paths
+        try:
+            from PIL import Image
+            kept = [paths[0]]
+            for p in paths[1:]:
+                is_dup = False
+                for k in kept:
+                    if ScreenshotOcrStage._images_similar(p, k):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    kept.append(p)
+            return kept
+        except ImportError:
+            return paths
+
+    @staticmethod
+    def _images_similar(path_a: str, path_b: str, threshold: float = 0.95) -> bool:
+        """Check if two images are nearly identical by pixel comparison."""
+        try:
+            from PIL import Image
+            a = Image.open(path_a).resize((64, 64)).convert("L")
+            b = Image.open(path_b).resize((64, 64)).convert("L")
+            pixels_a = list(a.getdata())
+            pixels_b = list(b.getdata())
+            same = sum(1 for pa, pb in zip(pixels_a, pixels_b) if abs(pa - pb) < 5)
+            return same / len(pixels_a) > threshold
+        except Exception:
+            return False
 
 
 # ============================================================
@@ -697,7 +808,7 @@ class ScreenshotOcrStage(ExtractionStage):
 class VisionLlmStage(ExtractionStage):
     stage_name = "vision_llm"
     stage_index = 6
-    description = "全页截图拼接 + GPT-4V/Claude Vision 提取。最后手段，最贵。"
+    description = "Full-page stitch + Vision LLM (GPT-4V/Claude). Last resort, most expensive."
 
     def extract(self, url: str, context: StageContext) -> PipelineStageResult:
         t0 = time.time()
@@ -708,7 +819,6 @@ class VisionLlmStage(ExtractionStage):
             from .ocr_providers import auto_configure_providers
             from .screenshot import dedup_screenshots, stitch_vertical
 
-            # 重用 OCR 阶段的截图（如果浏览器还在）
             paths = context.screenshot_paths
             if not paths and context.browser_available:
                 from .screenshot import capture_views
@@ -719,7 +829,6 @@ class VisionLlmStage(ExtractionStage):
                 result.timing_ms = int((time.time() - t0) * 1000)
                 return result
 
-            # 去重 + 拼接
             paths = dedup_screenshots(paths) or paths
             stitched = stitch_vertical(paths)
             context.stitched_image_path = stitched
@@ -730,15 +839,26 @@ class VisionLlmStage(ExtractionStage):
                 if hasattr(p, 'extract_from_image')
             ]
 
-            for provider in vision_providers[:1]:
+            # Multi-model fallback: try all vision providers
+            models_tried = []
+            for provider in vision_providers:
+                provider_name = getattr(provider, 'model_name',
+                                        provider.__class__.__name__)
                 try:
                     text = provider.extract_from_image(stitched)
+                    models_tried.append({"model": provider_name, "chars": len(text) if text else 0})
                     if text and len(text) > 200:
                         result.text = text
                         result.success = True
+                        # Estimate cost
+                        result.metadata["models_tried"] = models_tried
+                        result.metadata["estimated_tokens"] = len(text) // 4  # rough estimate
                         break
-                except Exception:
+                except Exception as exc:
+                    models_tried.append({"model": provider_name, "error": str(exc)[:100]})
                     continue
+
+            result.metadata["models_tried"] = models_tried
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -849,6 +969,7 @@ class Pipeline:
                 keyword_hint=keyword,
                 config=self.config,
                 detected_content_type=attempt_url.get("type", ""),
+                _pipeline=self,
             )
 
             # 运行 fallback 链
