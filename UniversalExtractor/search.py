@@ -23,19 +23,59 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _http_fetch(
+    url: str,
+    method: str = "GET",
+    headers: Optional[dict] = None,
+    data: Optional[bytes] = None,
+    timeout: int = 15,
+) -> Optional[bytes]:
+    """
+    HTTP request with TLS fingerprint impersonation (curl_cffi).
+    Falls back to urllib if curl_cffi is unavailable.
+
+    Returns response body as bytes, or None on failure.
+    """
+    # Try curl_cffi first (browser TLS fingerprint)
+    try:
+        from scrapling import Fetcher
+
+        fetcher = Fetcher()
+        fetcher.configure(auto_referer=False, keep_alive=True)
+        if method == "POST":
+            resp = fetcher.post(url, headers=headers or {}, data=data or b"")
+        else:
+            resp = fetcher.get(url, headers=headers or {})
+
+        if resp and resp.content:
+            return resp.content
+    except Exception:
+        pass
+
+    # Fallback to urllib
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
 # Brave Search 免费 API：https://api.search.brave.com
 BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
 def _search_brave(query: str, max_results: int = 10) -> list[str]:
-    """Brave Search API — 免费，中文搜索质量好。"""
+    """Brave Search API — free, good Chinese search quality."""
     api_key = os.getenv("BRAVE_API_KEY", "")
     if not api_key:
         logger.debug("Brave Search: no API key, skipping")
         return []
 
     try:
-        import urllib.request
         import json
 
         params = urllib.parse.urlencode({
@@ -43,16 +83,19 @@ def _search_brave(query: str, max_results: int = 10) -> list[str]:
             "count": min(max_results, 20),
             "search_lang": "zh",
         })
-        req = urllib.request.Request(
+        body = _http_fetch(
             f"{BRAVE_API_URL}?{params}",
             headers={
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip",
                 "X-Subscription-Token": api_key,
             },
+            timeout=10,
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        if not body:
+            return []
+
+        data = json.loads(body)
 
         urls = []
         for item in data.get("web", {}).get("results", []):
@@ -67,22 +110,18 @@ def _search_brave(query: str, max_results: int = 10) -> list[str]:
 
 
 def _search_exa(query: str, max_results: int = 10) -> list[str]:
-    """
-    Exa Search — 语义搜索，Agent Reach 用的主力引擎。
-
-    需要 Exa MCP Server 已启动，或设置 EXA_API_KEY 环境变量。
-    """
+    """Exa Search — semantic search with TLS fingerprint impersonation."""
     api_key = os.getenv("EXA_API_KEY", "")
     if not api_key:
         logger.debug("Exa Search: no API key, skipping")
         return []
 
     try:
-        import urllib.request
         import json
 
-        req = urllib.request.Request(
+        body = _http_fetch(
             "https://api.exa.ai/search",
+            method="POST",
             data=json.dumps({
                 "query": query,
                 "numResults": min(max_results, 10),
@@ -92,9 +131,12 @@ def _search_exa(query: str, max_results: int = 10) -> list[str]:
                 "Content-Type": "application/json",
                 "x-api-key": api_key,
             },
+            timeout=15,
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
+        if not body:
+            return []
+
+        data = json.loads(body)
 
         urls = []
         for item in data.get("results", []):
@@ -110,16 +152,12 @@ def _search_exa(query: str, max_results: int = 10) -> list[str]:
 
 def _search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
     """
-    DuckDuckGo HTML 搜索 — 免费，不需要 API Key。
-
-    用 html.duckduckgo.com 获取搜索结果，解析 uddg= 重定向链接
-    提取真实 URL。DuckDuckGo 用 uddg 参数编码目标 URL。
+    DuckDuckGo HTML search — free, no API key needed.
+    Uses TLS fingerprint impersonation via curl_cffi.
     """
     try:
-        import urllib.request
-
         params = urllib.parse.urlencode({"q": query})
-        req = urllib.request.Request(
+        body = _http_fetch(
             f"https://html.duckduckgo.com/html/?{params}",
             headers={
                 "User-Agent": (
@@ -129,9 +167,12 @@ def _search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
                 ),
                 "Accept": "text/html",
             },
+            timeout=10,
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        if not body:
+            return []
+
+        html = body.decode("utf-8", errors="replace")
 
         # DuckDuckGo 用 uddg= 参数编码目标 URL
         # 格式: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com
