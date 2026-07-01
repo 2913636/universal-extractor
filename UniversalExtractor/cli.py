@@ -67,6 +67,12 @@ def _emit(content: str, output: str | None) -> None:
     if output:
         Path(output).write_text(content, encoding="utf-8")
     else:
+        # Reconfigure for UTF-8 to avoid UnicodeEncodeError on non-UTF-8
+        # terminals (e.g. Git Bash with GBK).
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
         print(content)
 
 
