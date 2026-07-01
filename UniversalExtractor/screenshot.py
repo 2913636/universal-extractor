@@ -213,8 +213,8 @@ def capture_views(
         fullpath = str(temp_dir / "ocr_full.png")
         page.screenshot(path=fullpath, full_page=True)
         paths.append(fullpath)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Full-page screenshot fallback failed: %s", exc)
 
     logger.info("Captured %d views (max_views=%d, overlap=%.0f%%)",
                 len(paths), max_views, overlap * 100)

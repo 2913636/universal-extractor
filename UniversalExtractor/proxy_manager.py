@@ -90,6 +90,11 @@ class ProxyManager:
         self._index = (self._index + 1) % len(self._proxies)
         return self._proxies[self._index]
 
+    def validate(self, proxy: str | dict) -> bool:
+        """Validate a proxy against the configured public IP endpoint."""
+        proxy_url = proxy.get("server", "") if isinstance(proxy, dict) else proxy
+        return bool(proxy_url) and self._validate_proxy(proxy_url)
+
     def mark_failed(self, proxy_url: str) -> None:
         """Mark a proxy as failed. It won't be returned until cooldown expires."""
         self._failed[proxy_url] = time.monotonic()

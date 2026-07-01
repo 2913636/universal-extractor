@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+CRAWLER_USER_AGENT = "UniversalExtractorBot/0.2 (+local-content-extraction)"
 
 
 @dataclass
@@ -114,20 +115,37 @@ class HTTPClient:
         for attempt in range(self.max_retries):
             try:
                 fetcher = Fetcher()
-                # Fetcher() uses defaults for keep_alive and auto_referer
+                request_headers = {"User-Agent": CRAWLER_USER_AGENT}
+                request_headers.update(headers or {})
+                request_options = {
+                    "headers": request_headers,
+                    "timeout": self.timeout,
+                    "impersonate": self.impersonate,
+                    "proxy": self.proxy,
+                    "follow_redirects": True,
+                    "max_redirects": 5,
+                    "retries": 0,
+                }
 
                 if method == "POST":
-                    resp = fetcher.post(
-                        url, headers=headers or {}, data=data or b""
-                    )
+                    resp = fetcher.post(url, data=data or b"", **request_options)
                 else:
-                    resp = fetcher.get(url, headers=headers or {})
+                    resp = fetcher.get(url, **request_options)
 
-                if resp and hasattr(resp, 'status_code'):
+                if resp is not None:
+                    status = getattr(resp, "status", getattr(resp, "status_code", 0))
+                    content = getattr(resp, "body", b"") or b""
+                    if isinstance(content, str):
+                        content = content.encode("utf-8")
+                    raw_text = getattr(resp, "html_content", "") or ""
+                    text = str(raw_text) if raw_text else content.decode(
+                        getattr(resp, "encoding", None) or "utf-8",
+                        errors="replace",
+                    )
                     return HTTPResponse(
-                        status_code=resp.status_code,
-                        text=getattr(resp, 'text', '') or '',
-                        content=getattr(resp, 'content', b'') or b'',
+                        status_code=status,
+                        text=text,
+                        content=content,
                         headers=dict(resp.headers) if resp.headers else {},
                         url=str(resp.url) if resp.url else url,
                     )
@@ -160,7 +178,10 @@ class HTTPClient:
 
         try:
             req = urllib.request.Request(
-                url, data=data, headers=headers or {}, method=method,
+                url,
+                data=data,
+                headers={"User-Agent": CRAWLER_USER_AGENT, **(headers or {})},
+                method=method,
             )
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 content = resp.read()

@@ -301,8 +301,8 @@ class UniversalExtractor:
                 page_action=action,
                 network_idle=True,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Initial DOM extraction failed: %s", exc)
 
         return collected[0] if collected else ""
 
@@ -595,8 +595,8 @@ class UniversalExtractor:
                     decoded = _decode(body)
                     if len(decoded) > 200:
                         captured.append(decoded)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("API response inspection failed: %s", exc)
 
         return on_response
 

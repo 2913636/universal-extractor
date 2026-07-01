@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 import random
 import logging
+import threading
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -44,6 +45,7 @@ class RateLimiter:
 
         self._last_request: dict[str, float] = {}
         self._in_flight: int = 0
+        self._lock = threading.Lock()
 
     # ----------------------------------------------------------------
     # Public API
@@ -55,38 +57,38 @@ class RateLimiter:
         Returns:
             Actual seconds waited (0 if no wait needed).
         """
-        now = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
 
-        # Concurrency gate
-        if self.max_concurrent > 0:
-            while self._in_flight >= self.max_concurrent:
-                time.sleep(0.1)
+            # Domain rate gate. Holding the lock also serializes concurrent
+            # async quick scans for the same domain.
+            waited = 0.0
+            if domain in self._last_request:
+                elapsed = now - self._last_request[domain]
+                if elapsed < self.min_interval:
+                    base_delay = self.min_interval - elapsed
+                    jitter_amount = base_delay * self.jitter
+                    delay = base_delay + random.uniform(-jitter_amount, jitter_amount)
+                    delay = max(0, delay)
+                    if delay > 0.001:
+                        time.sleep(delay)
+                        waited = delay
 
-        # Domain rate gate
-        waited = 0.0
-        if domain in self._last_request:
-            elapsed = now - self._last_request[domain]
-            if elapsed < self.min_interval:
-                base_delay = self.min_interval - elapsed
-                # Add random jitter to avoid mechanical patterns
-                jitter_amount = base_delay * self.jitter
-                delay = base_delay + random.uniform(-jitter_amount, jitter_amount)
-                delay = max(0, delay)
-                if delay > 0.001:
-                    time.sleep(delay)
-                    waited = delay
-
-        self._last_request[domain] = time.monotonic()
-        return waited
+            self._last_request[domain] = time.monotonic()
+            return waited
 
     def enter(self, domain: str) -> None:
         """Call before request: waits + increments in-flight counter."""
+        while self.max_concurrent > 0 and self._in_flight >= self.max_concurrent:
+            time.sleep(0.1)
         self.wait(domain)
-        self._in_flight += 1
+        with self._lock:
+            self._in_flight += 1
 
     def exit(self) -> None:
         """Call after request completes: decrements in-flight counter."""
-        self._in_flight = max(0, self._in_flight - 1)
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
 
     def wait_for_url(self, url: str) -> float:
         """Convenience: extract domain from URL and wait."""

@@ -268,12 +268,13 @@ def _inject_via_cdp_interception(page) -> None:
             # body may be base64-encoded
             if body_result.get("base64Encoded", False):
                 body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as exc:
+            logger.debug("Canvas response body unavailable: %s", exc)
             # Can't get body — fulfil unmodified
             try:
                 cdp.send("Fetch.fulfillRequest", {"requestId": request_id})
-            except Exception:
-                pass
+            except Exception as fulfil_exc:
+                logger.debug("Canvas unmodified fulfil failed: %s", fulfil_exc)
             return
 
         # Inject Hook script before any other content
@@ -314,12 +315,13 @@ def _inject_via_cdp_interception(page) -> None:
                 "responseHeaders": fulfill_headers,
                 "body": base64.b64encode(modified.encode("utf-8")).decode(),
             })
-        except Exception:
+        except Exception as exc:
+            logger.debug("Canvas modified response fulfil failed: %s", exc)
             # Fallback: fulfil unmodified
             try:
                 cdp.send("Fetch.fulfillRequest", {"requestId": request_id})
-            except Exception:
-                pass
+            except Exception as fulfil_exc:
+                logger.debug("Canvas fallback fulfil failed: %s", fulfil_exc)
 
     cdp.on("Fetch.requestPaused", _on_request_paused)
     cdp.detach()

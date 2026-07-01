@@ -51,6 +51,7 @@ def test_proxy_manager_default():
     p = pm.get_proxy()
     # No proxy env var → should return None
     assert p is None or isinstance(p, dict)
+    assert callable(pm.validate)
     print(f"PASS: ProxyManager proxy={p}")
 
 
@@ -72,6 +73,14 @@ def test_session_manager():
     sm.clear("integration-test.example.com")
     assert not p.exists()
     print("PASS: SessionManager create/clear")
+
+
+def test_session_manager_persist_dir_alias(tmp_path):
+    """The development-book persist_dir API remains supported."""
+    from UniversalExtractor.session_manager import SessionManager
+
+    manager = SessionManager(persist_dir=str(tmp_path))
+    assert manager.get_profile("example.com").parent == tmp_path
 
 
 def test_search_with_metadata():

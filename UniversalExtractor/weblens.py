@@ -339,8 +339,8 @@ class WebLens:
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=10000)
                 page.wait_for_timeout(1000)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("DOM load wait ended early: %s", exc)
 
             # Extract text（使用统一的共享选择器）
             sels_js = ",".join(_CHAPTER_SELECTORS)
@@ -534,8 +534,8 @@ class WebLens:
                     return chapters;
                 }""")
                 chapter_links.extend(links or [])
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Chapter-link DOM extraction failed: %s", exc)
 
         try:
             StealthyFetcher.fetch(
@@ -735,8 +735,8 @@ class WebLens:
                 }""")
                 if text:
                     collected.append(text)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Fast DOM extraction callback failed: %s", exc)
 
         try:
             StealthyFetcher.fetch(
@@ -746,8 +746,8 @@ class WebLens:
                 page_action=action,
                 network_idle=False,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Fast DOM scan failed for %s: %s", url[:60], exc)
 
         text = collected[0] if collected else ""
         if _has_font_encryption(text):
