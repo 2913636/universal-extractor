@@ -40,8 +40,10 @@ class SessionManager:
         base_dir: Optional[str] = None,
         max_age_days: int = 7,
         max_profile_size_mb: int = 200,
+        *,
+        persist_dir: Optional[str] = None,
     ):
-        self.base_dir = Path(base_dir or self._default_dir())
+        self.base_dir = Path(base_dir or persist_dir or self._default_dir())
         self.max_age_days = max_age_days
         self.max_profile_size_mb = max_profile_size_mb
         self.base_dir.mkdir(parents=True, exist_ok=True)

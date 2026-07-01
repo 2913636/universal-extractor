@@ -1,112 +1,75 @@
-"""
-UniversalExtractor — 通用网页内容提取器。
+"""UniversalExtractor public API with lightweight, lazy imports."""
 
-7 级降级链 + 闭环搜索验证:
-  Jina Reader → curl_cffi HTTP → Browser DOM → Canvas Hook
-  → CDP Heap → Screenshot OCR → Vision LLM
+from __future__ import annotations
 
-Pipeline — 闭环编排:
-    from universal_extractor import Pipeline
+from importlib import import_module
+from typing import Any
 
-    pipeline = Pipeline()
-    result = pipeline.run("三体 小说 全文")
-    print(result.text)
-
-UniversalExtractor — 直接提取:
-    from universal_extractor import UniversalExtractor, ExtractionError
-
-    ue = UniversalExtractor(headless=False)
-    text = ue.extract("https://example.com/article")
-    print(text)
-
-WebLens — 搜 + 筛 + 抓:
-    from universal_extractor import WebLens
-
-    wl = WebLens(headless=True)
-    result = wl.search_and_extract("三体 小说 全文")
-    print(result.text)
-"""
-
-from .extractor import UniversalExtractor, ExtractionError, ExtractionResult
-from .jd_engine import JDEngine, JDResult, PLATFORM_CONFIG
-from .ocr_providers import (
-    VisionProvider,
-    OpenAIProvider,
-    AnthropicProvider,
-    QwenProvider,
-    DeepSeekProvider,
-    TesseractProvider,
-    auto_configure_providers,
-)
-from .search import search_urls, is_likely_content_url
-from .classifier import classify_url, score_content, match_keywords
-from .weblens import WebLens, WebLensResult
-from .http_client import HTTPClient, HTTPResponse
-from .rate_limiter import RateLimiter
-from .proxy_manager import ProxyManager
-from .session_manager import SessionManager
-from .captcha_solver import CaptchaSolver, CaptchaResult
-from .pipeline import (
-    Pipeline,
-    PipelineConfig,
-    PipelineResult,
-    PipelineStageResult,
-    StageContext,
-    StageRegistry,
-    ExtractionStage,
-    JinaReaderStage,
-    CurlCffiStage,
-    BrowserDomStage,
-    CanvasHookStage,
-    CdpHeapStage,
-    ScreenshotOcrStage,
-    VisionLlmStage,
-)
-
-__all__ = [
-    # Core
-    "UniversalExtractor",
-    "ExtractionError",
-    "ExtractionResult",
-    # Pipeline
-    "Pipeline",
-    "PipelineConfig",
-    "PipelineResult",
-    "PipelineStageResult",
-    "StageContext",
-    "StageRegistry",
-    "ExtractionStage",
-    "JinaReaderStage",
-    "CurlCffiStage",
-    "BrowserDomStage",
-    "CanvasHookStage",
-    "CdpHeapStage",
-    "ScreenshotOcrStage",
-    "VisionLlmStage",
-    # JD
-    "JDEngine",
-    "JDResult",
-    "PLATFORM_CONFIG",
-    # WebLens
-    "WebLens",
-    "WebLensResult",
+_EXPORTS = {
+    # Direct extraction
+    "UniversalExtractor": (".extractor", "UniversalExtractor"),
+    "ExtractionError": (".extractor", "ExtractionError"),
+    "ExtractionResult": (".extractor", "ExtractionResult"),
+    # Closed-loop pipeline
+    "Pipeline": (".pipeline", "Pipeline"),
+    "PipelineConfig": (".pipeline", "PipelineConfig"),
+    "PipelineResult": (".pipeline", "PipelineResult"),
+    "PipelineStageResult": (".pipeline", "PipelineStageResult"),
+    "StageContext": (".pipeline", "StageContext"),
+    "StageRegistry": (".pipeline", "StageRegistry"),
+    "ExtractionStage": (".pipeline", "ExtractionStage"),
+    "JinaReaderStage": (".pipeline", "JinaReaderStage"),
+    "CurlCffiStage": (".pipeline", "CurlCffiStage"),
+    "BrowserDomStage": (".pipeline", "BrowserDomStage"),
+    "CanvasHookStage": (".pipeline", "CanvasHookStage"),
+    "CdpHeapStage": (".pipeline", "CdpHeapStage"),
+    "ScreenshotOcrStage": (".pipeline", "ScreenshotOcrStage"),
+    "VisionLlmStage": (".pipeline", "VisionLlmStage"),
+    # Legacy facades and JD
+    "WebLens": (".weblens", "WebLens"),
+    "WebLensResult": (".weblens", "WebLensResult"),
+    "JDEngine": (".jd_engine", "JDEngine"),
+    "JDResult": (".jd_engine", "JDResult"),
+    "PLATFORM_CONFIG": (".jd_engine", "PLATFORM_CONFIG"),
     # Infrastructure
-    "HTTPClient",
-    "HTTPResponse",
-    "RateLimiter",
-    "ProxyManager",
-    "SessionManager",
-    "CaptchaSolver",
-    "CaptchaResult",
-    # Search
-    "search_urls",
-    "is_likely_content_url",
-    # Vision
-    "VisionProvider",
-    "OpenAIProvider",
-    "AnthropicProvider",
-    "QwenProvider",
-    "DeepSeekProvider",
-    "TesseractProvider",
-    "auto_configure_providers",
-]
+    "HTTPClient": (".http_client", "HTTPClient"),
+    "HTTPResponse": (".http_client", "HTTPResponse"),
+    "RateLimiter": (".rate_limiter", "RateLimiter"),
+    "ProxyManager": (".proxy_manager", "ProxyManager"),
+    "SessionManager": (".session_manager", "SessionManager"),
+    "CaptchaSolver": (".captcha_solver", "CaptchaSolver"),
+    "CaptchaResult": (".captcha_solver", "CaptchaResult"),
+    # Search and classification
+    "search_urls": (".search", "search_urls"),
+    "search_compare": (".search", "search_compare"),
+    "is_likely_content_url": (".search", "is_likely_content_url"),
+    "classify_url": (".classifier", "classify_url"),
+    "score_content": (".classifier", "score_content"),
+    "match_keywords": (".classifier", "match_keywords"),
+    # Vision/OCR providers
+    "VisionProvider": (".ocr_providers", "VisionProvider"),
+    "OpenAIProvider": (".ocr_providers", "OpenAIProvider"),
+    "AnthropicProvider": (".ocr_providers", "AnthropicProvider"),
+    "QwenProvider": (".ocr_providers", "QwenProvider"),
+    "DeepSeekProvider": (".ocr_providers", "DeepSeekProvider"),
+    "TesseractProvider": (".ocr_providers", "TesseractProvider"),
+    "auto_configure_providers": (".ocr_providers", "auto_configure_providers"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Load a public symbol on first access and cache it in this module."""
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = target
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy public symbols to introspection tools."""
+    return sorted(set(globals()) | set(__all__))

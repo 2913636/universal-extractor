@@ -66,6 +66,70 @@ def test_vision_llm_enhanced():
     print("PASS: VisionLlmStage registered")
 
 
+def test_screenshot_ocr_passes_base64_and_prompt(tmp_path, monkeypatch):
+    """OCR providers receive their documented base64/prompt arguments."""
+    from PIL import Image
+    from UniversalExtractor import ocr_providers, screenshot
+    from UniversalExtractor.pipeline import ScreenshotOcrStage, StageContext
+
+    image_path = tmp_path / "frame.png"
+    Image.new("RGB", (40, 40), "white").save(image_path)
+
+    class Page:
+        def is_closed(self):
+            return False
+
+    class Provider:
+        name = "fake"
+
+        def extract_text(self, image_b64, prompt, **_kwargs):
+            assert image_b64.startswith("iVBOR")
+            assert "visible text" in prompt
+            return "recognized content " * 20
+
+    monkeypatch.setattr(screenshot, "capture_views", lambda *_args, **_kwargs: [str(image_path)])
+    monkeypatch.setattr(ocr_providers, "auto_configure_providers", lambda: [Provider()])
+    context = StageContext(_page=Page())
+    result = ScreenshotOcrStage().extract("https://example.com", context)
+
+    assert result.success
+    context.close_browser()
+
+
+def test_vision_llm_batches_images(tmp_path, monkeypatch):
+    """Vision sends large screenshot sets in bounded batches."""
+    from PIL import Image
+    from UniversalExtractor import ocr_providers, screenshot
+    from UniversalExtractor.pipeline import VisionLlmStage, StageContext
+
+    paths = []
+    for index in range(5):
+        path = tmp_path / f"frame-{index}.png"
+        Image.new("RGB", (40, 40), (index * 30, 0, 0)).save(path)
+        paths.append(str(path))
+
+    class Provider:
+        name = "openai"
+        model = "fake-vision"
+
+        def extract_text(self, image_b64, prompt, **_kwargs):
+            assert image_b64.startswith("iVBOR")
+            return "vision content " * 20
+
+    monkeypatch.setattr(
+        ocr_providers,
+        "auto_configure_providers",
+        lambda **_kwargs: [Provider()],
+    )
+    monkeypatch.setattr(screenshot, "dedup_screenshots", lambda paths: paths)
+    context = StageContext(screenshot_paths=paths)
+    result = VisionLlmStage().extract("https://example.com", context)
+
+    assert result.success
+    assert result.metadata["image_batches"] == 2
+    context.close_browser()
+
+
 def test_pipeline_context_has_infra():
     """StageContext has _pipeline reference for accessing infra modules."""
     from UniversalExtractor.pipeline import StageContext, PipelineConfig
@@ -98,10 +162,11 @@ def test_curl_cffi_stage_extract_integration():
     stage = CurlCffiStage()
     ctx = StageContext(url="https://httpbin.org/html", config=PipelineConfig())
     result = stage.extract("https://httpbin.org/html", ctx)
-    # May succeed or fail depending on network, but should not crash
+    # Network may be unavailable, but installed-API incompatibility is a bug.
     assert result.stage_name == "curl_cffi_http"
     assert result.timing_ms >= 0
     assert result.success or result.error  # Must set one or the other
+    assert "has no attribute" not in (result.error or "")
     print(f"PASS: CurlCffiStage httpbin: success={result.success}, chars={result.char_count}")
 
 

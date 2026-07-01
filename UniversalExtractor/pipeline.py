@@ -16,17 +16,22 @@ Search → Verify → Extract(fallback chain) → Validate → Return
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
+import shutil
+import tempfile
 import time
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Any, Callable
 
 from .completeness import completeness_score, text_density_curve
 from .classifier import classify_url, score_content
 
 logger = logging.getLogger(__name__)
+CRAWLER_USER_AGENT = "UniversalExtractorBot/0.2 (+local-content-extraction)"
 
 
 # ============================================================
@@ -96,8 +101,8 @@ class PipelineStageResult:
             if self.completeness == 0.0:
                 try:
                     self.completeness = completeness_score(self.text)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Completeness scoring failed: %s", exc)
 
 
 @dataclass
@@ -175,11 +180,13 @@ class StageContext:
     stitched_image_path: str = ""
     detected_content_type: str = ""
     font_encryption_detected: bool = False
+    request_headers: dict[str, str] = field(default_factory=dict)
 
     # --- Browser lifecycle (shared by stages 2-6) ---
     _browser_session: Any = None
     _page: Any = None
     _page_setup_done: bool = False
+    _temp_dir: str = ""
 
     # --- Tracked results ---
     stage_results: list[PipelineStageResult] = field(default_factory=list)
@@ -194,7 +201,27 @@ class StageContext:
 
     @property
     def browser_available(self) -> bool:
-        return self._page is not None
+        return self._page is not None and not self._page.is_closed()
+
+    def close_browser(self) -> None:
+        """Close the shared browser session after stages 2-6 finish."""
+        if self._browser_session is not None:
+            try:
+                self._browser_session.close()
+            except Exception as exc:
+                logger.debug("Shared browser cleanup failed: %s", exc)
+            finally:
+                self._browser_session = None
+                self._page = None
+        if self._temp_dir:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            self._temp_dir = ""
+
+    def get_temp_dir(self) -> str:
+        """Return a per-run temporary directory for screenshots."""
+        if not self._temp_dir:
+            self._temp_dir = tempfile.mkdtemp(prefix="ue_")
+        return self._temp_dir
 
 
 # ============================================================
@@ -219,6 +246,13 @@ class ExtractionStage(ABC):
     def can_handle(self, url: str, context: StageContext) -> bool:
         """预检查：此阶段是否可能对这个 URL 有效。"""
         return True
+
+    @staticmethod
+    def _wait_for_request(url: str, context: StageContext) -> None:
+        """Apply the pipeline's per-domain request limit when available."""
+        pipeline = context._pipeline
+        if pipeline is not None:
+            pipeline.limiter.wait_for_url(url)
 
 
 class StageRegistry:
@@ -273,11 +307,13 @@ class JinaReaderStage(ExtractionStage):
         try:
             import urllib.request
 
+            reader_url = f"https://r.jina.ai/{url}"
+            self._wait_for_request(reader_url, context)
             req = urllib.request.Request(
-                f"https://r.jina.ai/{url}",
+                reader_url,
                 headers={
                     "Accept": "text/markdown",
-                    "User-Agent": "WebLens/1.0",
+                    "User-Agent": CRAWLER_USER_AGENT,
                 },
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -354,25 +390,37 @@ class CurlCffiStage(ExtractionStage):
         try:
             fetcher = Fetcher()
             # keep_alive and auto_referer set via Fetcher defaults
+            self._wait_for_request(url, context)
 
-            # Follow redirects (max 5 hops)
-            current_url = url
-            for _ in range(5):
-                resp = fetcher.fetch(current_url)
-                if resp and resp.status_code in (301, 302, 303, 307, 308):
-                    loc = resp.headers.get("Location") or resp.headers.get("location")
-                    if loc:
-                        from urllib.parse import urljoin as _urljoin
-                        current_url = _urljoin(current_url, loc)
-                        continue
-                break
+            proxy = None
+            if context._pipeline is not None:
+                proxy = context._pipeline.proxy_manager.get_proxy_string()
+            request_headers = {"User-Agent": CRAWLER_USER_AGENT}
+            request_headers.update(context.request_headers)
+            resp = fetcher.get(
+                url,
+                headers=request_headers,
+                proxy=proxy,
+                timeout=context.config.timeout / 1000,
+                follow_redirects=True,
+                max_redirects=5,
+            )
 
-            if not resp or not resp.text:
+            status = getattr(resp, "status", getattr(resp, "status_code", 0))
+            if status >= 400:
+                result.error = f"HTTP {status}"
+                result.timing_ms = int((time.time() - t0) * 1000)
+                return result
+
+            raw_html = getattr(resp, "html_content", "") if resp is not None else ""
+            if isinstance(raw_html, bytes):
+                raw_html = raw_html.decode("utf-8", errors="replace")
+            if resp is None or not raw_html:
                 result.error = "empty response"
                 result.timing_ms = int((time.time() - t0) * 1000)
                 return result
 
-            html = resp.text
+            html = str(raw_html)
             # Truncate oversized responses (>5MB → keep first 1MB)
             if len(html) > 5 * 1024 * 1024:
                 logger.debug("CurlCffiStage: truncating %d bytes → 1MB", len(html))
@@ -388,9 +436,10 @@ class CurlCffiStage(ExtractionStage):
                 if self._looks_garbled(text):
                     try:
                         import chardet
-                        detected = chardet.detect(resp.content or b"")
+                        response_body = getattr(resp, "body", b"") or b""
+                        detected = chardet.detect(response_body)
                         if detected and detected.get("encoding"):
-                            text = (resp.content or b"").decode(
+                            text = response_body.decode(
                                 detected["encoding"], errors="replace"
                             )
                             text = self._extract_text(text)
@@ -400,6 +449,8 @@ class CurlCffiStage(ExtractionStage):
                 if text and len(text) > 100:
                     result.text = text
                     result._sync()
+            if not result.success and result.error is None:
+                result.error = "insufficient extracted content"
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -467,7 +518,8 @@ class BrowserDomStage(ExtractionStage):
             return result
 
         try:
-            from scrapling import StealthyFetcher
+            from scrapling.engines._browsers._stealth import StealthySession
+            self._wait_for_request(url, context)
 
             collected: list[str] = []
             api_responses: list[str] = []
@@ -478,10 +530,11 @@ class BrowserDomStage(ExtractionStage):
 
             def action(page):
                 try:
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    page.wait_for_load_state("networkidle", timeout=60000)
                     page.wait_for_timeout(2000)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Browser load-state wait ended early: %s", exc)
 
                 # DOM 提取
                 sel_js = ",".join(self._CONTENT_SELECTORS)
@@ -541,21 +594,23 @@ class BrowserDomStage(ExtractionStage):
                                 if retry_text:
                                     collected.append(retry_text)
                                     result.metadata["captcha_solved"] = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Captcha inspection/solve failed: %s", exc)
 
             # Anti-bot hardening
             domain = url.split("/")[2] if "://" in url else url
-            fetch_kwargs = {
+            session_kwargs = {
                 "headless": context.config.headless,
                 "timeout": context.config.timeout,
-                "page_setup": setup,
-                "page_action": action,
                 "network_idle": False,
                 # Anti-bot features
                 "solve_cloudflare": True,
                 "block_webrtc": True,
                 "dns_over_https": True,
+                "extra_headers": {
+                    "User-Agent": CRAWLER_USER_AGENT,
+                    **context.request_headers,
+                },
             }
 
             # Proxy
@@ -563,16 +618,25 @@ class BrowserDomStage(ExtractionStage):
             if hasattr(context, '_pipeline') and context._pipeline:
                 proxy = context._pipeline.proxy_manager.get_proxy()
             if proxy:
-                fetch_kwargs["proxy"] = proxy
+                session_kwargs["proxy"] = proxy
 
             # Session persistence
             session_dir = None
             if hasattr(context, '_pipeline') and context._pipeline:
                 session_dir = context._pipeline.sessions.get_profile(domain)
             if session_dir:
-                fetch_kwargs["user_data_dir"] = str(session_dir)
+                session_kwargs["user_data_dir"] = str(session_dir)
 
-            StealthyFetcher.fetch(url, **fetch_kwargs)
+            browser_session = StealthySession(**session_kwargs)
+            browser_session.start()
+            context._browser_session = browser_session
+            page = browser_session.context.new_page()
+            setup(page)
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            page_html = page.content().lower()
+            if "just a moment" in page_html or "cf-turnstile" in page_html:
+                browser_session._cloudflare_solver(page)
+            action(page)
 
             # 合并 DOM + API 响应
             all_text = "\n\n".join(collected)
@@ -602,8 +666,8 @@ class BrowserDomStage(ExtractionStage):
                 body = resp.text()
                 if body and len(body) > 500:
                     api_responses.append(body[:10000])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Browser API response inspection failed: %s", exc)
 
 
 # ============================================================
@@ -763,7 +827,7 @@ class ScreenshotOcrStage(ExtractionStage):
             from .ocr_providers import auto_configure_providers
 
             page = context._page
-            screenshots = capture_views(page)
+            screenshots = capture_views(page, context.get_temp_dir())
 
             # Pixel-hash dedup: remove near-duplicate screenshots
             screenshots = self._dedup_screenshots(screenshots)
@@ -786,20 +850,27 @@ class ScreenshotOcrStage(ExtractionStage):
                 best_conf = 0
                 for provider in providers[:2]:
                     try:
-                        ocr_result = provider.extract_text(path)
+                        image_b64 = base64.b64encode(Path(path).read_bytes()).decode()
+                        ocr_result = provider.extract_text(
+                            image_b64,
+                            prompt="Extract all visible text exactly. Return text only.",
+                        )
                         if isinstance(ocr_result, tuple):
                             text, conf = ocr_result
                         else:
-                            text, conf = ocr_result, 0.5
+                            # Providers without confidence are accepted at the
+                            # documented minimum rather than silently discarded.
+                            text, conf = ocr_result, 0.6
                         if text and len(text) > 50:
                             if conf > best_conf:
                                 best_text = text
                                 best_conf = conf
                             if conf > 0.6:  # Good enough, don't try other providers
                                 break
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("OCR provider failed for %s: %s", path, exc)
                         continue
-                if best_text and best_conf > 0.4:
+                if best_text and best_conf >= 0.6:
                     all_text.append(best_text)
 
             if all_text:
@@ -870,7 +941,7 @@ class VisionLlmStage(ExtractionStage):
             paths = context.screenshot_paths
             if not paths and context.browser_available:
                 from .screenshot import capture_views
-                paths = capture_views(context._page)
+                paths = capture_views(context._page, context.get_temp_dir())
 
             if not paths:
                 result.error = "no screenshots available"
@@ -878,35 +949,56 @@ class VisionLlmStage(ExtractionStage):
                 return result
 
             paths = dedup_screenshots(paths) or paths
-            stitched = stitch_vertical(paths)
-            context.stitched_image_path = stitched
+            providers = auto_configure_providers(
+                prefer=["openai", "anthropic", "qwen", "deepseek"],
+            )
+            vision_providers = [p for p in providers if p.name != "tesseract"]
+            if not vision_providers:
+                result.error = "no Vision LLM providers configured"
+                result.timing_ms = int((time.time() - t0) * 1000)
+                return result
 
-            providers = auto_configure_providers()
-            vision_providers = [
-                p for p in providers
-                if hasattr(p, 'extract_from_image')
-            ]
-
-            # Multi-model fallback: try all vision providers
             models_tried = []
-            for provider in vision_providers:
-                provider_name = getattr(provider, 'model_name',
-                                        provider.__class__.__name__)
-                try:
-                    text = provider.extract_from_image(stitched)
-                    models_tried.append({"model": provider_name, "chars": len(text) if text else 0})
-                    if text and len(text) > 200:
-                        result.text = text
-                        result._sync()
-                        # Estimate cost
-                        result.metadata["models_tried"] = models_tried
-                        result.metadata["estimated_tokens"] = len(text) // 4  # rough estimate
-                        break
-                except Exception as exc:
-                    models_tried.append({"model": provider_name, "error": str(exc)[:100]})
+            batch_texts = []
+            stitched_paths = []
+            for batch_index in range(0, len(paths), 4):
+                output_path = str(
+                    Path(context.get_temp_dir()) / f"vision_{batch_index // 4:03d}.png"
+                )
+                stitched = stitch_vertical(paths[batch_index:batch_index + 4], output_path)
+                if not stitched:
                     continue
+                stitched_paths.append(stitched)
+                image_b64 = base64.b64encode(Path(stitched).read_bytes()).decode()
+                for provider in vision_providers:
+                    provider_name = getattr(provider, "model", provider.name)
+                    try:
+                        text = provider.extract_text(
+                            image_b64,
+                            prompt="Extract all visible text exactly. Return text only.",
+                        )
+                        models_tried.append({
+                            "model": provider_name,
+                            "batch": batch_index // 4,
+                            "chars": len(text) if text else 0,
+                        })
+                        if text and len(text) > 50:
+                            batch_texts.append(text)
+                            break
+                    except Exception as exc:
+                        models_tried.append({
+                            "model": provider_name,
+                            "batch": batch_index // 4,
+                            "error": str(exc)[:100],
+                        })
 
+            if batch_texts:
+                result.text = "\n\n".join(batch_texts)
+                result._sync()
+            context.stitched_image_path = stitched_paths[0] if stitched_paths else ""
             result.metadata["models_tried"] = models_tried
+            result.metadata["image_batches"] = len(stitched_paths)
+            result.metadata["estimated_tokens"] = len(result.text) // 4
 
         except Exception as exc:
             result.error = str(exc)[:200]
@@ -994,7 +1086,9 @@ class Pipeline:
             return result
 
         # --- Phase 2: Verify ---
-        ranked = self._phase_verify(candidates, keyword, result)
+        # A user-supplied URL must reach the fallback chain even when Jina's
+        # quick scan is unavailable or returns an SPA shell.
+        ranked = candidates if url else self._phase_verify(candidates, keyword, result)
         result.search_candidates_scanned = len(ranked)
 
         if not ranked:
@@ -1006,6 +1100,10 @@ class Pipeline:
         t_extract = time.time()
         best_text = ""
         best_score = 0.0
+        fallback_text = ""
+        fallback_score = 0.0
+        fallback_stage = ""
+        fallback_url: Optional[str] = None
 
         for attempt_url in ranked[:self.config.max_extract_attempts]:
             url_str = attempt_url["url"]
@@ -1030,11 +1128,17 @@ class Pipeline:
                 context.stage_results.append(stage_result)
 
                 if stage_result.success:
+                    if stage_result.completeness > fallback_score:
+                        fallback_text = stage_result.text
+                        fallback_score = stage_result.completeness
+                        fallback_stage = stage.stage_name
+                        fallback_url = url_str
                     # 即时验证
                     passes, details = self._validate(
                         stage_result.text,
                         keyword=keyword,
                         content_type=context.detected_content_type,
+                        baseline_text=attempt_url.get("preview", ""),
                     )
                     result.validation_details = details
 
@@ -1057,6 +1161,7 @@ class Pipeline:
 
             # 记录这个 URL 的尝试
             result.extraction_chain.extend(context.stage_results)
+            context.close_browser()
             if not best_text:
                 result.url_failures.append({
                     "url": url_str,
@@ -1068,9 +1173,16 @@ class Pipeline:
             if best_score >= self.config.min_completeness:
                 break
 
-        result.text = best_text
-        result.score = best_score
+        result.text = best_text or fallback_text
+        result.score = best_score if best_text else fallback_score
         result.success = best_score >= self.config.min_completeness
+        if not best_text and fallback_text:
+            result.url = fallback_url
+            result.winning_stage = fallback_stage
+            result.validation_details["result"] = "best_effort"
+            result.validation_details.setdefault(
+                "failure_reason", "all extracted candidates failed validation",
+            )
         result.extract_time_ms = int((time.time() - t_extract) * 1000)
 
         # --- Phase 5 (optional): Cross Validation ---
@@ -1141,7 +1253,7 @@ class Pipeline:
             return result
 
         # --- Phase 2: Verify (async, parallel candidates) ---
-        ranked = await self._phase_verify_async(candidates, keyword, result)
+        ranked = candidates if url else await self._phase_verify_async(candidates, keyword, result)
         result.search_candidates_scanned = len(ranked)
 
         if not ranked:
@@ -1152,6 +1264,10 @@ class Pipeline:
         t_extract = time.time()
         best_text = ""
         best_score = 0.0
+        fallback_text = ""
+        fallback_score = 0.0
+        fallback_stage = ""
+        fallback_url: Optional[str] = None
 
         for attempt_url in ranked[:self.config.max_extract_attempts]:
             url_str = attempt_url["url"]
@@ -1168,9 +1284,15 @@ class Pipeline:
                 stage_result = stage.extract(url_str, context)
                 context.stage_results.append(stage_result)
                 if stage_result.success:
+                    if stage_result.completeness > fallback_score:
+                        fallback_text = stage_result.text
+                        fallback_score = stage_result.completeness
+                        fallback_stage = stage.stage_name
+                        fallback_url = url_str
                     passes, details = self._validate(
                         stage_result.text, keyword=keyword,
                         content_type=context.detected_content_type,
+                        baseline_text=attempt_url.get("preview", ""),
                     )
                     result.validation_details = details
                     if passes:
@@ -1182,12 +1304,20 @@ class Pipeline:
                         if stage_result.completeness >= self.config.min_completeness:
                             break
             result.extraction_chain.extend(context.stage_results)
+            context.close_browser()
             if best_score >= self.config.min_completeness:
                 break
 
-        result.text = best_text
-        result.score = best_score
+        result.text = best_text or fallback_text
+        result.score = best_score if best_text else fallback_score
         result.success = best_score >= self.config.min_completeness
+        if not best_text and fallback_text:
+            result.url = fallback_url
+            result.winning_stage = fallback_stage
+            result.validation_details["result"] = "best_effort"
+            result.validation_details.setdefault(
+                "failure_reason", "all extracted candidates failed validation",
+            )
         result.extract_time_ms = int((time.time() - t_extract) * 1000)
         result.total_time_ms = int((time.time() - t_total) * 1000)
 
@@ -1236,7 +1366,7 @@ class Pipeline:
                 loop = asyncio.get_running_loop()
                 req = urllib.request.Request(
                     f"https://r.jina.ai/{url}",
-                    headers={"Accept": "text/markdown", "User-Agent": "WebLens/1.0"},
+                    headers={"Accept": "text/markdown", "User-Agent": CRAWLER_USER_AGENT},
                 )
 
                 def _fetch():
@@ -1247,6 +1377,7 @@ class Pipeline:
                     except Exception:
                         return ""
 
+                await asyncio.to_thread(self.limiter.wait, "r.jina.ai")
                 preview = await loop.run_in_executor(None, _fetch)
 
                 if not preview or len(preview.strip()) < self.config.min_preview_chars:
@@ -1339,11 +1470,12 @@ class Pipeline:
             # Jina 快扫
             preview = ""
             try:
+                self.limiter.wait("r.jina.ai")
                 req = urllib.request.Request(
                     f"https://r.jina.ai/{url}",
                     headers={
                         "Accept": "text/markdown",
-                        "User-Agent": "WebLens/1.0",
+                        "User-Agent": CRAWLER_USER_AGENT,
                     },
                 )
                 with urllib.request.urlopen(req, timeout=8) as resp:
@@ -1398,6 +1530,7 @@ class Pipeline:
         text: str,
         keyword: str = "",
         content_type: str = "",
+        baseline_text: str = "",
     ) -> tuple[bool, dict]:
         """
         Phase 4: 质量检查。
@@ -1419,8 +1552,8 @@ class Pipeline:
         comp = 0.0
         try:
             comp = completeness_score(text)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Completeness validation failed: %s", exc)
         details["completeness"] = round(comp, 3)
         if comp < self.config.min_completeness:
             details["checks"].append(f"completeness {comp:.2f} < {self.config.min_completeness}")
@@ -1456,8 +1589,8 @@ class Pipeline:
                 else:
                     details["checks"].append("density curve balanced ✓")
                     details["passed"] += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Density validation failed: %s", exc)
 
         # Check 4: Font encryption (PUA chars)
         has_pua = self._has_pua(text)
@@ -1493,6 +1626,21 @@ class Pipeline:
             details["failed"] += 1
             passes = False
 
+        # Check 8: extraction should remain consistent with the earlier
+        # quick-scan of the same URL. Empty/short previews are inconclusive.
+        if len(baseline_text) >= 200 and len(text) >= 200:
+            consistency = self._text_consistency(text, baseline_text)
+            details["content_consistency"] = round(consistency, 3)
+            if consistency < 0.05:
+                details["checks"].append(
+                    f"content inconsistent with quick scan ({consistency:.2f})"
+                )
+                details["failed"] += 1
+                passes = False
+            else:
+                details["checks"].append("content consistency ✓")
+                details["passed"] += 1
+
         details["result"] = "PASS" if passes else "FAIL"
         return passes, details
 
@@ -1503,6 +1651,19 @@ class Pipeline:
             return 0.0
         cjk = sum(1 for c in text if '一' <= c <= '鿿')
         return cjk / len(text)
+
+    @staticmethod
+    def _text_consistency(text: str, baseline: str) -> float:
+        """Estimate same-page consistency using normalized character trigrams."""
+        def trigrams(value: str) -> set[str]:
+            normalized = re.sub(r"\s+", "", value.lower())[:4000]
+            return {normalized[i:i + 3] for i in range(max(0, len(normalized) - 2))}
+
+        left = trigrams(text)
+        right = trigrams(baseline)
+        if not left or not right:
+            return 1.0
+        return len(left & right) / min(len(left), len(right))
 
     @staticmethod
     def _has_pua(text: str) -> bool:

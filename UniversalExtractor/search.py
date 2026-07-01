@@ -198,8 +198,8 @@ def _search_ddg_lite(query: str, max_results: int = 10) -> list[str]:
                     if decoded not in seen:
                         seen.add(decoded)
                         urls.append(decoded)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("DuckDuckGo redirect decode failed: %s", exc)
 
         logger.info("DuckDuckGo Lite: %d results for '%s'", len(urls), query[:50])
         return urls[:max_results]
@@ -416,6 +416,22 @@ def search_with_metadata(
         "total_raw": total_raw,
         "total_unique": len(url_sources),
     }
+
+
+def search_compare(
+    query: str,
+    max_results: int = 15,
+    *,
+    backends: Optional[list[str]] = None,
+    site_filter: Optional[str] = None,
+) -> dict:
+    """Return each URL together with engines and rank positions that found it."""
+    return search_with_metadata(
+        query,
+        max_results=max_results,
+        backends=backends,
+        site_filter=site_filter,
+    )
 
 
 async def search_with_metadata_async(
