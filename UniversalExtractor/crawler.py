@@ -151,7 +151,8 @@ class Crawler:
 
             # Check against pattern or auto-detector
             if matcher:
-                if not matcher.search(text):
+                # Match against link text OR href, whichever hits first
+                if not (matcher.search(text) or matcher.search(href)):
                     continue
                 key = self._sort_key(text)
             else:
