@@ -27,3 +27,4 @@ batch_novel.py
 
 # Sensitive
 .env
+DELIVERY_REPORT.md
