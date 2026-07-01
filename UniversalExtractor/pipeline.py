@@ -388,8 +388,6 @@ class CurlCffiStage(ExtractionStage):
             return result
 
         try:
-            fetcher = Fetcher()
-            # keep_alive and auto_referer set via Fetcher defaults
             self._wait_for_request(url, context)
 
             proxy = None
@@ -397,7 +395,7 @@ class CurlCffiStage(ExtractionStage):
                 proxy = context._pipeline.proxy_manager.get_proxy_string()
             request_headers = {"User-Agent": CRAWLER_USER_AGENT}
             request_headers.update(context.request_headers)
-            resp = fetcher.get(
+            resp = Fetcher.get(
                 url,
                 headers=request_headers,
                 proxy=proxy,

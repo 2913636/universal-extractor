@@ -114,7 +114,6 @@ class HTTPClient:
         last_error = None
         for attempt in range(self.max_retries):
             try:
-                fetcher = Fetcher()
                 request_headers = {"User-Agent": CRAWLER_USER_AGENT}
                 request_headers.update(headers or {})
                 request_options = {
@@ -128,9 +127,9 @@ class HTTPClient:
                 }
 
                 if method == "POST":
-                    resp = fetcher.post(url, data=data or b"", **request_options)
+                    resp = Fetcher.post(url, data=data or b"", **request_options)
                 else:
-                    resp = fetcher.get(url, **request_options)
+                    resp = Fetcher.get(url, **request_options)
 
                 if resp is not None:
                     status = getattr(resp, "status", getattr(resp, "status_code", 0))
