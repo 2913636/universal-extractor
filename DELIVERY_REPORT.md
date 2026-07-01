@@ -58,5 +58,5 @@
 [x] 2. P0 bug = 0, P1 bug = 0
 [x] 3. 回归测试 ALL PASSED (17/17)
 [x] 4. DELIVERY_REPORT.md 已更新
-[ ] 5. PR 已创建并合并到 master（发布步骤进行中）
+[x] 5. PR #10 已创建并合并到 master
 ```
