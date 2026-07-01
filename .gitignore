@@ -21,5 +21,9 @@ Thumbs.db
 *.tmp
 *.log
 
+# Scraped content (exclude from version control)
+changshi_*
+batch_novel.py
+
 # Sensitive
 .env

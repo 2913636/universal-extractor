@@ -162,6 +162,34 @@ def _format_batch(items: list[dict[str, Any]], output_format: str) -> str:
     return "\n\n=====\n\n".join(item["text"] for item in items)
 
 
+def cmd_crawl(args: argparse.Namespace) -> int:
+    """Discover links on a catalog page and extract every matching page."""
+    from .crawler import Crawler
+
+    crawler = Crawler(
+        headless=args.headless,
+        min_completeness=args.min_score,
+        timeout=30_000,
+    )
+    if not args.output:
+        print("Error: --output/-o is required for crawl", file=sys.stderr)
+        return 2
+
+    result = crawler.crawl(
+        url=args.url,
+        output=args.output,
+        title=args.title or "",
+        pattern=args.pattern,
+        max_links=args.max_links,
+    )
+    print(
+        f"\nCrawl complete: {result.extracted}/{result.total_links} extracted"
+        f"{f' ({result.failed} failed)' if result.failed else ''}"
+        f" → {result.output} ({result.total_chars:,} chars)"
+    )
+    return 0 if result.extracted > 0 else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(description="UniversalExtractor closed-loop scraper")
@@ -171,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         "search": ("query", cmd_search),
         "extract": ("url", cmd_extract),
         "batch": ("file", cmd_batch),
+        "crawl": ("url", cmd_crawl),
     }
     for name, (argument, handler) in specs.items():
         command = commands.add_parser(name)
@@ -184,6 +213,15 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--max-candidates", type=int, default=10)
         command.set_defaults(handler=handler)
     commands.choices["run"].add_argument("--cross-validate", action="store_true")
+    # crawl-specific arguments
+    crawl_cmd = commands.choices["crawl"]
+    crawl_cmd.add_argument("--title", help="Title for the merged output file")
+    crawl_cmd.add_argument(
+        "--pattern", help="Regex pattern to match links (auto-detect if omitted)"
+    )
+    crawl_cmd.add_argument(
+        "--max-links", type=int, help="Maximum number of links to follow"
+    )
     return parser
 
 
